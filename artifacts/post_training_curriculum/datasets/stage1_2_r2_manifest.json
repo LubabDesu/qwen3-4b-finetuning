@@ -1,0 +1,70 @@
+{
+  "source_caps": {
+    "openr1_default": 6500,
+    "mathinstruct_aqua_rat": 1500
+  },
+  "preferred_row_range": [
+    8000,
+    9500
+  ],
+  "minimum_row_count": 7000,
+  "total_records": 8498,
+  "records_before_validation": 8500,
+  "final_records_after_validation": 8498,
+  "source_counts": {
+    "openr1_default": 6498,
+    "stage0_format_anchor": 1000,
+    "mathinstruct_aqua_rat": 1000
+  },
+  "accepted_by_source": {
+    "openr1_default": 6500,
+    "mathinstruct_aqua_rat": 1000
+  },
+  "drop_counts": {
+    "openr1:no_clean_verified_generation": 54725,
+    "mathinstruct:too_short": 3222,
+    "mathinstruct:answer_extract_fail": 1989,
+    "mathinstruct:missing_question_or_options": 1,
+    "mathinstruct:empty_reasoning": 2,
+    "mathinstruct:noise_phrase": 8,
+    "mathinstruct:abrupt_tail": 21,
+    "mathinstruct:codey_output": 7,
+    "validation:invalid_answer_field": 2
+  },
+  "validation_error_count": 2,
+  "validation_error_examples": [
+    {
+      "row_index": 1691,
+      "source": "openr1_default",
+      "original_source": "openr1:olympiads_ref",
+      "reason": "invalid_answer_field",
+      "question_preview": "Determine all functions $f: \\mathbb{R} \\rightarrow \\mathbb{R}$ that satisfy \\n$$ (f(a)-f(b))(f(b)-f(c))(f(c)-f(a))=f\\left(a b^{2}+b c^{2}+c a^{2}\\right)-f\\left(a^{2} b+b^{2} c+c^{2...",
+      "answer_preview": "f(x)=\\alpha x+\\beta  or  f(x)=\\alpha x^{3}+\\beta  where  \\alpha \\in\\{-1,0,1\\}  and  \\beta \\in \\mathbb{R}",
+      "target_answer_preview": "f(x)=\\alpha x+\\beta  or  f(x)=\\alpha x^{3}+\\beta  where  \\alpha \\in\\{-1,0,1\\}  and  \\beta \\in \\mathbb{R}"
+    },
+    {
+      "row_index": 2735,
+      "source": "openr1_default",
+      "original_source": "openr1:olympiads",
+      "reason": "invalid_answer_field",
+      "question_preview": "2. Using the letters $a, b, c$ to form a word of length $n$ (i.e., a word composed of $n$ letters), if no two $a$s are adjacent, how many such words are there?",
+      "answer_preview": "a_{n}=\\frac{2+\\sqrt{3}}{2\\sqrt{3}}(1+\\sqrt{3})^{n}+\\frac{-2+\\sqrt{3}}{2\\sqrt{3}}(1-\\sqrt{3})^{n}",
+      "target_answer_preview": "a_{n}=\\frac{2+\\sqrt{3}}{2\\sqrt{3}}(1+\\sqrt{3})^{n}+\\frac{-2+\\sqrt{3}}{2\\sqrt{3}}(1-\\sqrt{3})^{n}"
+    }
+  ],
+  "word_counts_by_source": {
+    "openr1_default": {
+      "min": 50,
+      "median": 535,
+      "max": 700
+    },
+    "mathinstruct_aqua_rat": {
+      "min": 50,
+      "median": 67,
+      "max": 460
+    }
+  },
+  "anchor_path": "/teamspace/studios/this_studio/artifacts/post_training_curriculum/datasets/stage0b_final_finetune.jsonl",
+  "out_path": "/teamspace/studios/this_studio/artifacts/post_training_curriculum/datasets/stage1_2_r2_records.jsonl",
+  "assertions_passed": false
+}

@@ -1,0 +1,13 @@
+{
+  "n": 200,
+  "accuracy": 0.175,
+  "correct": 35,
+  "mcq_accuracy": 0.15,
+  "mcq_total": 20,
+  "multi_answer_accuracy": 0.06666666666666667,
+  "multi_answer_total": 15,
+  "avg_response_words": 118.165,
+  "boxed_compliance_rate": 0.86,
+  "inference_backend": "vllm",
+  "partial": true
+}

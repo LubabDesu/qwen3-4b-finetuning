@@ -1,0 +1,50 @@
+{
+    "final_output": "results/distill_stage0b/stage0b_final_finetune.jsonl",
+    "remaining_rejects": "results/distill_stage0b/stage0b_remaining_rejects.jsonl",
+    "row_count": 872,
+    "input_counts": {
+      "stage0b_final_finetune.jsonl": 793,
+      "stage0b_mcq10_deepseek_pro_retry_6000.jsonl": 80
+    },
+    "bucket_counts": {
+      "mcq10": 315,
+      "table_many": 98,
+      "single": 158,
+      "multi": 291,
+      "multi_select": 10
+    },
+    "source_counts": {
+      "stage0b_openrouter_mcq10_deepseek/deepseek-v4-pro": 290,
+      "stage0b_openrouter_multi_deepseek/deepseek-v4-pro": 211,
+      "stage0b_openrouter_single_deepseek/deepseek-v4-pro": 111,
+      "stage0b_openrouter_table_many_deepseek/deepseek-v4-pro": 67,
+      "stage0b_codex_public_completion_multi": 37,
+      "synthetic_stage0b_multi": 30,
+      "stage0b_codex_public_completion_single": 23,
+      "synthetic_stage0b_single": 20,
+      "synthetic_stage0b_table_many": 20,
+      "synthetic_stage0b_mcq10": 20,
+      "stage0b_codex_public_completion_pass2_multi": 13,
+      "stage0b_codex_public_completion_pass2_table_many": 11,
+      "synthetic_stage0b_multi_select": 10,
+      "stage0b_claude_repair_mcq10": 5,
+      "stage0b_codex_public_completion_pass2_single": 4
+    },
+    "reason_len": {
+      "min": 69,
+      "avg": 538,
+      "max": 2036
+    },
+    "remaining_reject_count": 71,
+    "remaining_reject_buckets": {
+      "mcq10": 51,
+      "table_many": 12,
+      "multi": 8
+    },
+    "skipped_duplicate_count": 0,
+    "last_validation_issues": 0,
+    "removed_after_validation": [
+      "public:896:mcq10 meta/inconsistent reasoning"
+    ]
+  }
+  

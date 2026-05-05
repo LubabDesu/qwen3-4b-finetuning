@@ -1,0 +1,89 @@
+{
+  "max_words": 600,
+  "source_caps": {
+    "numina_synthetic_math": 3000,
+    "numina_orca_math": 2500,
+    "numina_synthetic_amc": 800,
+    "numina_gsm8k": 200,
+    "openmathreasoning_easy": 300
+  },
+  "accepted_by_source": {
+    "numina_synthetic_math": 3000,
+    "numina_orca_math": 2500,
+    "numina_synthetic_amc": 800,
+    "numina_gsm8k": 200,
+    "openmathreasoning_easy": 0
+  },
+  "drop_counts": {
+    "source_not_allowed:numina_cn_k12": 7041,
+    "math_qa_easy_dropped": 3500,
+    "omr_over_400_preclean": 1152,
+    "answer_too_long": 419,
+    "noise_remains:correct option:": 1,
+    "too_short": 214,
+    "noise_remains:final answer:": 11,
+    "bad_mcq_target_answer": 56,
+    "noise_remains:key point": 1,
+    "think_tags": 4,
+    "noise_remains:analysis:": 23,
+    "noise_remains:correct answer:": 2,
+    "early_noise:option a:": 2,
+    "too_long": 1,
+    "cap_reached:numina_synthetic_amc": 687,
+    "cap_reached:numina_orca_math": 1251,
+    "cap_reached:numina_synthetic_math": 1130,
+    "cap_reached:numina_gsm8k": 5
+  },
+  "truncation_counts": {
+    "the answer is": 55,
+    "the final answer is": 333,
+    "conclusion:": 957,
+    "the correct answer is": 25,
+    "final answer:": 23,
+    "final answer is": 7,
+    "in summary": 5,
+    "to summarize": 1,
+    "analysis:": 1,
+    "key point": 1
+  },
+  "relaxed_word_ceiling_to_800": false,
+  "raw_path": "artifacts/post_training_curriculum/datasets/stage1_2_records.jsonl",
+  "anchor_path": "artifacts/post_training_curriculum/datasets/stage0b_final_finetune.jsonl",
+  "out_path": "artifacts/post_training_curriculum/datasets/stage1_2_clean_records.jsonl",
+  "preferred_row_range": [
+    8000,
+    9300
+  ],
+  "minimum_row_count": 6000,
+  "total_records": 7500,
+  "source_counts": {
+    "numina_synthetic_math": 3000,
+    "numina_synthetic_amc": 800,
+    "stage0_format_anchor": 1000,
+    "numina_orca_math": 2500,
+    "numina_gsm8k": 200
+  },
+  "word_counts_by_source": {
+    "numina_synthetic_math": {
+      "min": 51,
+      "median": 126,
+      "max": 429
+    },
+    "numina_synthetic_amc": {
+      "min": 51,
+      "median": 176,
+      "max": 364
+    },
+    "numina_orca_math": {
+      "min": 51,
+      "median": 173,
+      "max": 508
+    },
+    "numina_gsm8k": {
+      "min": 51,
+      "median": 157,
+      "max": 312
+    }
+  },
+  "assertions_passed": true
+}
