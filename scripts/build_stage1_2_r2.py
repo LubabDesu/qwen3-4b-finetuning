@@ -9,7 +9,7 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from datasets import load_dataset
 
@@ -18,6 +18,8 @@ OPENR1_TARGET = 6500
 MATHINSTRUCT_MAX = 1500
 ANCHOR_CAP = 1000
 ANCHOR_SOURCE = "stage0_format_anchor"
+DEFAULT_TOKENIZER_NAME_OR_PATH = "Qwen/Qwen3-4B-Thinking-2507"
+DEFAULT_MAX_RENDERED_TOKENS = 7000
 PREFERRED_MIN_ROWS = 8000
 PREFERRED_MAX_ROWS = 9500
 MIN_ACCEPTED_ROWS = 7000
@@ -47,7 +49,6 @@ R2_NOISE_PHRASES = [
     "correct option:",
     "knowledge point",
     "knowledge tested",
-    "difficulty level",
     "self-evaluation",
     "conclusion:",
 ]
@@ -59,6 +60,7 @@ MCQ_ANSWER_RE = re.compile(
 THINK_BLOCK_RE = re.compile(r"^\s*<think>\s*(.*?)\s*</think>\s*$", flags=re.S)
 TRAILING_BOX_RE = re.compile(r"\s*\\boxed\s*\{", flags=re.S)
 INLINE_OPTION_RE = re.compile(r"\(([A-J])\)\s*(.*?)(?=(?:\s*\([A-J]\)\s*)|$)", flags=re.S)
+CHINESE_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -81,6 +83,29 @@ def normalize_text_answer(text: str) -> str:
     text = str(text or "").strip()
     text = re.sub(r"\\(?:text|textbf|mathrm|mathbf)\{([^{}]*)\}", r"\1", text)
     return text.strip()
+
+
+def option_labels(n: int) -> list[str]:
+    return [chr(65 + i) for i in range(n)]
+
+
+def format_options(options: Sequence[str] | None) -> str:
+    if not options:
+        return ""
+    return "\n".join(f"{label}. {str(opt).strip()}" for label, opt in zip(option_labels(len(options)), options))
+
+
+def build_user_problem(question: str, options: Sequence[str] | None = None) -> str:
+    if options:
+        return f"{question}\n\nOptions:\n{format_options(options)}"
+    return question
+
+
+SYSTEM_PROMPT = """You are an expert mathematician. Solve the problem step by step and put your final answer within \\boxed{}.
+
+For multi-part questions with [ANS] blanks: put all answers comma-separated in one \\boxed{}.
+For MCQ: identify the correct option and put only the letter in \\boxed{}.
+Never round intermediate calculations."""
 
 
 def extract_all_boxed(text: str) -> list[str]:
@@ -176,6 +201,69 @@ def replace_boxed_with_inner(text: str) -> str:
     return "".join(out)
 
 
+def clean_stage0_assistant_content(text: str) -> str:
+    text = str(text or "")
+    replacements = [
+        (r"\s*This confirms the requested (?:value|answer|expression|computation|result)\.\s*", " "),
+        (
+            r"\s*The computation also checks the ordering requested, which is enough to identify the requested result\.\s*",
+            " The final answer is listed in the required order. ",
+        ),
+        (r"\s*The computation also checks the ordering requested\.\s*", " The final answer is listed in order. "),
+        (r"\brequested\b", "required"),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text, flags=re.I)
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def make_assistant_content(reasoning: str, final_answer: Any) -> str:
+    final_raw = normalize_text_answer(final_answer)
+    final_boxes = [box.strip() for box in extract_all_boxed(final_raw) if box.strip()]
+    final = final_boxes[-1] if final_boxes else re.sub(r"\\boxed\s*\{\s*\}", "", final_raw).strip()
+    reasoning = re.sub(r"</?think>\s*", "", str(reasoning or "")).strip()
+    if not reasoning:
+        reasoning = "I solve the problem carefully and keep the final answer in the required format."
+    return f"<think>\n{reasoning}\n</think>\n\n\\boxed{{{final}}}"
+
+
+def assistant_text_for_render(row: dict[str, Any]) -> str:
+    if row.get("target"):
+        return clean_stage0_assistant_content(row["target"])
+    return clean_stage0_assistant_content(
+        make_assistant_content(row.get("reasoning", ""), row.get("target_answer", row.get("answer", "")))
+    )
+
+
+def rendered_token_length(tokenizer: Any, row: dict[str, Any]) -> int:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_problem(row["question"], row.get("options"))},
+        {"role": "assistant", "content": assistant_text_for_render(row)},
+    ]
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    return len(tokenizer(full_text, add_special_tokens=False).input_ids)
+
+
+def load_tokenizer_for_filter(model_name_or_path: str) -> Any:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    eos_candidates = [tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"]
+    for token in eos_candidates:
+        if token is None:
+            continue
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None:
+            tokenizer.eos_token = token
+            tokenizer.pad_token = token
+            tokenizer.padding_side = "right"
+            return tokenizer
+    raise ValueError("Could not find a valid EOS token in tokenizer vocabulary")
+
+
 def ends_abruptly(text: str) -> bool:
     text = str(text or "").strip()
     if not text:
@@ -210,7 +298,7 @@ def normalize_openr1_answer(answer: Any) -> str:
     return text.strip()
 
 
-def clean_reasoning(reasoning: str, *, max_words: int, min_words: int = 50) -> tuple[str | None, str]:
+def clean_reasoning(reasoning: str, *, min_words: int = 50) -> tuple[str | None, str]:
     text = strip_outer_think(reasoning)
     text = strip_trailing_boxed(text)
     text = replace_boxed_with_inner(text)
@@ -226,11 +314,11 @@ def clean_reasoning(reasoning: str, *, max_words: int, min_words: int = 50) -> t
         return None, "boxed_remains"
     if any(phrase in text.lower() for phrase in R2_NOISE_PHRASES):
         return None, "noise_phrase"
+    if CHINESE_CHAR_RE.search(text):
+        return None, "chinese_characters"
     wc = word_count(text)
     if wc < min_words:
         return None, "too_short"
-    if wc > max_words:
-        return None, "too_long"
     if ends_abruptly(text):
         return None, "abrupt_tail"
     return text, ""
@@ -304,8 +392,10 @@ def validate_record(row: dict[str, Any]) -> str | None:
         return "boxed_remains"
     if any(phrase in reasoning.lower() for phrase in R2_NOISE_PHRASES):
         return "noise_phrase_remains"
-    if not (50 <= word_count(reasoning) <= 700):
-        return "reasoning_word_count_out_of_range"
+    if CHINESE_CHAR_RE.search(reasoning):
+        return "chinese_characters"
+    if word_count(reasoning) < 50:
+        return "reasoning_too_short"
     if row.get("is_mcq"):
         if not re.fullmatch(r"[A-J]", target_answer):
             return "non_letter_mcq_target_answer"
@@ -350,6 +440,79 @@ def filter_valid_records(
     return valid, examples
 
 
+def filter_rendered_token_lengths(
+    records: list[dict[str, Any]],
+    drop_counts: collections.Counter[str],
+    *,
+    tokenizer: Any | None,
+    max_rendered_tokens: int | None,
+    max_examples: int = 20,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if tokenizer is None or max_rendered_tokens is None or max_rendered_tokens <= 0:
+        return records, {"enabled": False}
+
+    kept: list[dict[str, Any]] = []
+    lengths_by_source: dict[str, list[int]] = collections.defaultdict(list)
+    examples: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(records):
+        source = str(row.get("source", "unknown"))
+        try:
+            length = rendered_token_length(tokenizer, row)
+        except Exception as exc:
+            drop_counts[f"{source}:rendered_tokenize_error"] += 1
+            if len(examples) < max_examples:
+                examples.append(
+                    {
+                        "row_index": idx,
+                        "source": source,
+                        "reason": "rendered_tokenize_error",
+                        "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                        "question_preview": preview_field(row.get("question")),
+                    }
+                )
+            continue
+
+        lengths_by_source[source].append(length)
+        if length > max_rendered_tokens:
+            drop_counts[f"{source}:rendered_too_long"] += 1
+            if len(examples) < max_examples:
+                examples.append(
+                    {
+                        "row_index": idx,
+                        "source": source,
+                        "reason": "rendered_too_long",
+                        "rendered_tokens": length,
+                        "max_rendered_tokens": max_rendered_tokens,
+                        "question_preview": preview_field(row.get("question")),
+                    }
+                )
+            continue
+
+        row = dict(row)
+        row["rendered_tokens"] = length
+        kept.append(row)
+
+    stats_by_source: dict[str, dict[str, int]] = {}
+    for source, values in lengths_by_source.items():
+        values = sorted(values)
+        if values:
+            stats_by_source[source] = {
+                "min": values[0],
+                "median": values[len(values) // 2],
+                "p95": values[int(0.95 * (len(values) - 1))],
+                "max": values[-1],
+            }
+
+    return kept, {
+        "enabled": True,
+        "max_rendered_tokens": max_rendered_tokens,
+        "dropped": len(records) - len(kept),
+        "token_lengths_by_source": stats_by_source,
+        "drop_examples": examples,
+    }
+
+
 def choose_openr1_generation(row: dict[str, Any]) -> tuple[str | None, str]:
     generations = list(row.get("generations") or [])
     complete = list(row.get("is_reasoning_complete") or [])
@@ -359,7 +522,7 @@ def choose_openr1_generation(row: dict[str, Any]) -> tuple[str | None, str]:
         if idx >= len(complete) or idx >= len(correct):
             continue
         if correct[idx] is True and complete[idx] is True:
-            cleaned, reason = clean_reasoning(generation, max_words=700)
+            cleaned, reason = clean_reasoning(generation)
             if cleaned:
                 candidates.append((word_count(cleaned), cleaned))
     if not candidates:
@@ -368,7 +531,13 @@ def choose_openr1_generation(row: dict[str, Any]) -> tuple[str | None, str]:
     return candidates[0][1], ""
 
 
-def load_openr1_rows(seed: int, drop_counts: collections.Counter[str]) -> list[dict[str, Any]]:
+def load_openr1_rows(
+    seed: int,
+    drop_counts: collections.Counter[str],
+    *,
+    tokenizer: Any | None = None,
+    max_rendered_tokens: int | None = None,
+) -> list[dict[str, Any]]:
     ds = load_dataset("open-r1/OpenR1-Math-220k", "default", split="train")
     rows = list(ds)
     random.Random(seed).shuffle(rows)
@@ -402,11 +571,27 @@ def load_openr1_rows(seed: int, drop_counts: collections.Counter[str]) -> list[d
             "openr1_problem_type": row.get("problem_type"),
             "openr1_uuid": row.get("uuid"),
         }
+        if tokenizer is not None and max_rendered_tokens:
+            try:
+                length = rendered_token_length(tokenizer, record)
+            except Exception:
+                drop_counts["openr1:rendered_tokenize_error"] += 1
+                continue
+            if length > max_rendered_tokens:
+                drop_counts["openr1:rendered_too_long"] += 1
+                continue
+            record["rendered_tokens"] = length
         accepted.append(record)
     return accepted
 
 
-def load_mathinstruct_rows(seed: int, drop_counts: collections.Counter[str]) -> list[dict[str, Any]]:
+def load_mathinstruct_rows(
+    seed: int,
+    drop_counts: collections.Counter[str],
+    *,
+    tokenizer: Any | None = None,
+    max_rendered_tokens: int | None = None,
+) -> list[dict[str, Any]]:
     ds = load_dataset("TIGER-Lab/MathInstruct", split="train")
     rows = [row for row in ds if str(row.get("source")) == "data/CoT/aqua_rat.json"]
     random.Random(seed).shuffle(rows)
@@ -431,23 +616,32 @@ def load_mathinstruct_rows(seed: int, drop_counts: collections.Counter[str]) -> 
             drop_counts["mathinstruct:codey_output"] += 1
             continue
         reasoning = remove_mcq_answer_sentence(output)
-        reasoning, reason = clean_reasoning(reasoning, max_words=650)
+        reasoning, reason = clean_reasoning(reasoning)
         if reason:
             drop_counts[f"mathinstruct:{reason}"] += 1
             continue
-        accepted.append(
-            {
-                "question": question,
-                "options": options,
-                "answer": answer,
-                "target_answer": answer,
-                "reasoning": reasoning,
-                "source": "mathinstruct_aqua_rat",
-                "original_source": "mathinstruct:data/CoT/aqua_rat.json",
-                "n_ans": question.count("[ANS]"),
-                "is_mcq": True,
-            }
-        )
+        record = {
+            "question": question,
+            "options": options,
+            "answer": answer,
+            "target_answer": answer,
+            "reasoning": reasoning,
+            "source": "mathinstruct_aqua_rat",
+            "original_source": "mathinstruct:data/CoT/aqua_rat.json",
+            "n_ans": question.count("[ANS]"),
+            "is_mcq": True,
+        }
+        if tokenizer is not None and max_rendered_tokens:
+            try:
+                length = rendered_token_length(tokenizer, record)
+            except Exception:
+                drop_counts["mathinstruct:rendered_tokenize_error"] += 1
+                continue
+            if length > max_rendered_tokens:
+                drop_counts["mathinstruct:rendered_too_long"] += 1
+                continue
+            record["rendered_tokens"] = length
+        accepted.append(record)
     return accepted
 
 
@@ -458,13 +652,26 @@ def build_stage1_2_r2_records(
     manifest_path: Path | None = None,
     seed: int = 151,
     force_rebuild: bool = False,
+    tokenizer_name_or_path: str | None = None,
+    max_rendered_tokens: int | None = DEFAULT_MAX_RENDERED_TOKENS,
 ) -> list[dict[str, Any]]:
     if out_path.exists() and not force_rebuild:
         return load_jsonl(out_path)
 
     drop_counts: collections.Counter[str] = collections.Counter()
-    openr1_records = load_openr1_rows(seed, drop_counts)
-    mathinstruct_records = load_mathinstruct_rows(seed + 17, drop_counts)
+    tokenizer = load_tokenizer_for_filter(tokenizer_name_or_path) if tokenizer_name_or_path and max_rendered_tokens else None
+    openr1_records = load_openr1_rows(
+        seed,
+        drop_counts,
+        tokenizer=tokenizer,
+        max_rendered_tokens=max_rendered_tokens,
+    )
+    mathinstruct_records = load_mathinstruct_rows(
+        seed + 17,
+        drop_counts,
+        tokenizer=tokenizer,
+        max_rendered_tokens=max_rendered_tokens,
+    )
 
     if len(openr1_records) < OPENR1_TARGET:
         drop_counts["openr1:shortfall"] += OPENR1_TARGET - len(openr1_records)
@@ -482,6 +689,16 @@ def build_stage1_2_r2_records(
     records_before_validation = len(records)
     records, validation_error_examples = filter_valid_records(records, drop_counts)
     validation_error_count = records_before_validation - len(records)
+    final_records_after_validation = len(records)
+
+    records_before_token_filter = len(records)
+    records, token_filter_manifest = filter_rendered_token_lengths(
+        records,
+        drop_counts,
+        tokenizer=tokenizer,
+        max_rendered_tokens=max_rendered_tokens,
+    )
+    rendered_token_drop_count = records_before_token_filter - len(records)
 
     source_counts = collections.Counter(str(row.get("source", "unknown")) for row in records)
     word_counts_by_source: dict[str, dict[str, int]] = {}
@@ -502,7 +719,10 @@ def build_stage1_2_r2_records(
         "minimum_row_count": MIN_ACCEPTED_ROWS,
         "total_records": len(records),
         "records_before_validation": records_before_validation,
-        "final_records_after_validation": len(records),
+        "final_records_after_validation": final_records_after_validation,
+        "records_before_token_filter": records_before_token_filter,
+        "rendered_token_drop_count": rendered_token_drop_count,
+        "rendered_token_filter": token_filter_manifest,
         "source_counts": dict(source_counts),
         "accepted_by_source": {
             "openr1_default": len(openr1_records),
@@ -530,6 +750,8 @@ def main() -> None:
     parser.add_argument("--out-path", type=Path, default=Path("artifacts/post_training_curriculum/datasets/stage1_2_r2_records.jsonl"))
     parser.add_argument("--manifest-path", type=Path, default=Path("artifacts/post_training_curriculum/datasets/stage1_2_r2_manifest.json"))
     parser.add_argument("--seed", type=int, default=151)
+    parser.add_argument("--tokenizer-name-or-path", default=DEFAULT_TOKENIZER_NAME_OR_PATH)
+    parser.add_argument("--max-rendered-tokens", type=int, default=DEFAULT_MAX_RENDERED_TOKENS)
     parser.add_argument("--force-rebuild", action="store_true")
     args = parser.parse_args()
 
@@ -539,6 +761,8 @@ def main() -> None:
         manifest_path=args.manifest_path,
         seed=args.seed,
         force_rebuild=args.force_rebuild,
+        tokenizer_name_or_path=args.tokenizer_name_or_path,
+        max_rendered_tokens=args.max_rendered_tokens,
     )
     manifest = json.loads(args.manifest_path.read_text())
     print(f"Built {len(records)} Stage 1-2 r2 records: {args.out_path}")
@@ -546,6 +770,7 @@ def main() -> None:
     print("Accepted by source before anchors:", manifest["accepted_by_source"])
     print("Top drop counts:", dict(collections.Counter(manifest["drop_counts"]).most_common(20)))
     print("Word counts by source:", manifest["word_counts_by_source"])
+    print("Rendered token filter:", manifest.get("rendered_token_filter"))
 
 
 if __name__ == "__main__":

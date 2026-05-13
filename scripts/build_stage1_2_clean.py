@@ -51,7 +51,6 @@ NOISE_PHRASES = [
     "correct option:",
     "knowledge point",
     "knowledge tested",
-    "difficulty level",
     "self-evaluation",
     "conclusion:",
 ]
@@ -65,6 +64,7 @@ MCQ_OPTION_LINE_RE = re.compile(
 )
 
 MCQ_INLINE_LABEL_RE = re.compile(r"\\textbf\{\(?([A-J])\)?\}")
+CHINESE_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 
 EARLY_POISON_PHRASES = [
     "self-check",
@@ -234,7 +234,7 @@ def validate_answer(answer: Any) -> tuple[bool, str]:
     return True, ""
 
 
-def clean_solution(raw_solution: str, max_words: int) -> tuple[str | None, str, str | None]:
+def clean_solution(raw_solution: str, min_words: int = 50) -> tuple[str | None, str, str | None]:
     solution = str(raw_solution or "").strip()
     if not solution:
         return None, "empty_solution", None
@@ -253,10 +253,10 @@ def clean_solution(raw_solution: str, max_words: int) -> tuple[str | None, str, 
     solution = re.sub(r"\n{3,}", "\n\n", solution).strip()
 
     wc = word_count(solution)
-    if wc <= 50:
+    if wc < min_words:
         return None, "too_short", trunc_phrase
-    if wc >= max_words:
-        return None, "too_long", trunc_phrase
+    if CHINESE_CHAR_RE.search(solution):
+        return None, "chinese_characters", trunc_phrase
     remaining_noise_pos, remaining_noise_phrase = first_phrase_pos(normalize_for_noise(solution), NOISE_PHRASES)
     if remaining_noise_pos >= 0:
         return None, f"noise_remains:{remaining_noise_phrase}", trunc_phrase
@@ -276,7 +276,7 @@ def clean_stage1_rows(
     raw_rows: list[dict[str, Any]],
     *,
     seed: int,
-    max_words: int,
+    min_words: int = 50,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rng = random.Random(seed)
     shuffled = list(raw_rows)
@@ -307,7 +307,7 @@ def clean_stage1_rows(
             drop_counts["omr_over_400_preclean"] += 1
             continue
 
-        cleaned, reason, trunc_phrase = clean_solution(str(row.get("reasoning", "")), max_words=max_words)
+        cleaned, reason, trunc_phrase = clean_solution(str(row.get("reasoning", "")), min_words=min_words)
         if reason:
             drop_counts[reason] += 1
             continue
@@ -342,7 +342,7 @@ def clean_stage1_rows(
         records.extend(rows)
 
     manifest = {
-        "max_words": max_words,
+        "min_words": min_words,
         "source_caps": CLEAN_SOURCE_CAPS,
         "accepted_by_source": {source: len(rows) for source, rows in accepted_by_source.items()},
         "drop_counts": dict(drop_counts),
@@ -382,8 +382,10 @@ def assert_clean_records(records: list[dict[str, Any]]) -> None:
             raise AssertionError(f"row {idx} still has boxed wrapper")
         if "<think>" in solution or "</think>" in solution:
             raise AssertionError(f"row {idx} still has think tags")
-        if not (50 < wc < 600):
-            raise AssertionError(f"row {idx} word count out of range: {wc}")
+        if wc < 50:
+            raise AssertionError(f"row {idx} word count below minimum: {wc}")
+        if CHINESE_CHAR_RE.search(solution):
+            raise AssertionError(f"row {idx} contains Chinese characters")
         if not (0 < len(answer) < 50):
             raise AssertionError(f"row {idx} bad answer length: {len(answer)}")
         if "\n" in answer or "\r" in answer:
@@ -407,13 +409,7 @@ def build_stage1_2_clean_records_from_cache(
         return load_jsonl(out_path)
 
     raw_rows = load_jsonl(raw_path)
-    clean_records, manifest = clean_stage1_rows(raw_rows, seed=seed, max_words=600)
-
-    if len(clean_records) < MIN_ACCEPTED_ROWS:
-        clean_records, manifest = clean_stage1_rows(raw_rows, seed=seed, max_words=800)
-        manifest["relaxed_word_ceiling_to_800"] = True
-    else:
-        manifest["relaxed_word_ceiling_to_800"] = False
+    clean_records, manifest = clean_stage1_rows(raw_rows, seed=seed)
 
     anchors = build_stage0_anchors(load_jsonl(anchor_path), seed=seed + 77, n=ANCHOR_CAP)
     records = clean_records + anchors
