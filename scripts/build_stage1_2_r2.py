@@ -139,7 +139,9 @@ SYSTEM_PROMPT = """You are an expert mathematician. Solve the problem step by st
 
 For multi-part questions with [ANS] blanks: put all answers comma-separated in one \\boxed{}.
 For MCQ: identify the correct option and put only the letter in \\boxed{}.
-Never round intermediate calculations."""
+Never round intermediate calculations.
+Never round your final answer unless the problem explicitly asks you to round.
+Keep full precision in all numerical answers."""
 
 
 def extract_all_boxed(text: str) -> list[str]:

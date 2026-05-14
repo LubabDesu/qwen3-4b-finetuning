@@ -63,6 +63,35 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override notebook EVAL_MAX_NEW_TOKENS for generation during eval.",
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Override vLLM max_model_len. Needed when --max-new-tokens is close to or above 8192.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="Override vLLM gpu_memory_utilization.",
+    )
+    parser.add_argument(
+        "--vllm-dtype",
+        default=None,
+        help="Override vLLM dtype, for example bfloat16.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override vLLM enforce_eager. Use --no-enforce-eager to enable CUDA graphs.",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Override vLLM max_num_seqs.",
+    )
     parser.add_argument("--keep-merged", action="store_true", help="Keep merged checkpoint models after eval.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip evals whose summary JSON already exists.")
     parser.add_argument(
@@ -100,7 +129,10 @@ def load_eval_namespace() -> SimpleNamespace:
     os.chdir(REPO_ROOT)
     module_name = "__stage1_2_checkpoint_eval__"
     module = ModuleType(module_name)
-    module.__file__ = str(NOTEBOOK_PATH)
+    # Keep __file__ pointed at this real Python script. vLLM uses multiprocessing
+    # spawn, and spawn re-executes __main__.__file__; pointing at the .ipynb JSON
+    # makes the worker try to run notebook JSON as Python.
+    module.__file__ = str(Path(__file__).resolve())
     sys.modules[module_name] = module
     namespace = module.__dict__
     cells = load_notebook_cells()
@@ -198,6 +230,77 @@ def merge_checkpoint(ns: SimpleNamespace, checkpoint_dir: Path, merged_dir: Path
     return merged_dir
 
 
+def apply_vllm_overrides(ns: SimpleNamespace, args: argparse.Namespace) -> None:
+    if args.max_new_tokens is not None:
+        ns.EVAL_MAX_NEW_TOKENS = args.max_new_tokens
+        ns.evaluate_model.__globals__["EVAL_MAX_NEW_TOKENS"] = args.max_new_tokens
+        print(f"[checkpoint_eval] EVAL_MAX_NEW_TOKENS={ns.EVAL_MAX_NEW_TOKENS}", flush=True)
+    if args.max_model_len is not None:
+        ns.MAX_SEQ_LENGTH = args.max_model_len
+        ns.load_vllm_engine.__globals__["MAX_SEQ_LENGTH"] = args.max_model_len
+        print(f"[checkpoint_eval] MAX_SEQ_LENGTH/max_model_len={ns.MAX_SEQ_LENGTH}", flush=True)
+    if args.gpu_memory_utilization is not None:
+        ns.VLLM_GPU_MEMORY_UTILIZATION = args.gpu_memory_utilization
+        ns.load_vllm_engine.__globals__["VLLM_GPU_MEMORY_UTILIZATION"] = args.gpu_memory_utilization
+        print(f"[checkpoint_eval] VLLM_GPU_MEMORY_UTILIZATION={ns.VLLM_GPU_MEMORY_UTILIZATION}", flush=True)
+    if args.vllm_dtype is not None:
+        ns.VLLM_DTYPE = args.vllm_dtype
+        ns.load_vllm_engine.__globals__["VLLM_DTYPE"] = args.vllm_dtype
+        print(f"[checkpoint_eval] VLLM_DTYPE={ns.VLLM_DTYPE}", flush=True)
+    if args.enforce_eager is not None:
+        ns.VLLM_ENFORCE_EAGER = args.enforce_eager
+        ns.load_vllm_engine.__globals__["VLLM_ENFORCE_EAGER"] = args.enforce_eager
+        print(f"[checkpoint_eval] VLLM_ENFORCE_EAGER={ns.VLLM_ENFORCE_EAGER}", flush=True)
+
+    if args.max_num_seqs is None:
+        return
+
+    base_load_vllm_engine = ns.load_vllm_engine
+
+    def load_vllm_engine_with_max_num_seqs(model_name_or_path: str):
+        import gc as _gc
+
+        if "__main__" in sys.modules:
+            sys.modules["__main__"].__file__ = str(Path(__file__).resolve())
+
+        ns.os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        ns.os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        _gc.collect()
+        if ns.torch.cuda.is_available():
+            ns.torch.cuda.empty_cache()
+            ns.torch.cuda.ipc_collect()
+
+        ns.require_vllm()
+
+        from transformers import AutoTokenizer
+        from vllm import LLM
+
+        model_path = str(model_name_or_path)
+        if Path(model_path).exists():
+            ns.fix_tokenizer_regex(model_path)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        tokenizer = ns.normalize_tokenizer_special_tokens(tokenizer)
+        llm = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            trust_remote_code=True,
+            dtype=ns.VLLM_DTYPE,
+            max_model_len=ns.MAX_SEQ_LENGTH,
+            tensor_parallel_size=ns.VLLM_TENSOR_PARALLEL_SIZE,
+            gpu_memory_utilization=ns.VLLM_GPU_MEMORY_UTILIZATION,
+            enforce_eager=ns.VLLM_ENFORCE_EAGER,
+            max_num_seqs=args.max_num_seqs,
+            generation_config="vllm",
+        )
+        return llm, tokenizer
+
+    load_vllm_engine_with_max_num_seqs.__globals__.update(base_load_vllm_engine.__globals__)
+    ns.load_vllm_engine = load_vllm_engine_with_max_num_seqs
+    ns.evaluate_model.__globals__["load_vllm_engine"] = load_vllm_engine_with_max_num_seqs
+    print(f"[checkpoint_eval] VLLM max_num_seqs={args.max_num_seqs}", flush=True)
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -206,9 +309,7 @@ def main() -> None:
 
     args = parse_args()
     ns = load_eval_namespace()
-    if args.max_new_tokens is not None:
-        ns.EVAL_MAX_NEW_TOKENS = args.max_new_tokens
-        print(f"[checkpoint_eval] EVAL_MAX_NEW_TOKENS={ns.EVAL_MAX_NEW_TOKENS}", flush=True)
+    apply_vllm_overrides(ns, args)
     eval_rows = load_public_eval_rows(args) if args.public_only else ns.eval_set
     args.merged_root.mkdir(parents=True, exist_ok=True)
 

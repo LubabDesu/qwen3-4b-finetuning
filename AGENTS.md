@@ -58,8 +58,13 @@
   - responses averaged around `638` words
   - many responses truncated before `\boxed{}`
   - partial checkpoint-100 public eval showed low boxed compliance
-- `scripts/evaluate_stage1_2_checkpoints.py` now supports:
-  - `--max-new-tokens 4096`
+- `scripts/evaluate_stage1_2_checkpoints.py` now supports vLLM eval overrides:
+  - `--max-new-tokens`
+  - `--max-model-len`
+  - `--gpu-memory-utilization`
+  - `--vllm-dtype`
+  - `--no-enforce-eager`
+  - `--max-num-seqs`
 
 ## Recommended Next Eval Command
 
@@ -69,7 +74,7 @@ Stop any old eval first if it is still running:
 ps -ef | grep evaluate_stage1_2_checkpoints
 ```
 
-Then run public 200-row eval with a larger generation cap:
+Then run public 100-row eval for checkpoints 200 and 530 with the long-context vLLM settings:
 
 ```bash
 mkdir -p logs
@@ -77,21 +82,27 @@ mkdir -p logs
 nohup env PYTHONUNBUFFERED=1 .venv/bin/python scripts/evaluate_stage1_2_checkpoints.py \
   --public-only \
   --public-path artifacts/post_training_curriculum/eval/public.jsonl \
-  --public-sample-size 200 \
+  --public-sample-size 100 \
   --public-seed 42 \
-  --steps 100 200 300 400 500 530 \
+  --steps 200 530 \
   --drive-source "gdrive:151B_SP26_Competition/checkpoints/stage1_2/trainer_stage1_2" \
-  --batch-size 5 \
-  --max-new-tokens 4096 \
-  > logs/eval_public_200_4096.log 2>&1 &
+  --batch-size 50 \
+  --max-new-tokens 8192 \
+  --max-model-len 12288 \
+  --gpu-memory-utilization 0.85 \
+  --vllm-dtype bfloat16 \
+  --no-enforce-eager \
+  --max-num-seqs 50 \
+  --keep-merged \
+  > logs/eval_public_100_ckpt200_530_8192.log 2>&1 &
 
-echo $! > logs/eval_public_200_4096.pid
+echo $! > logs/eval_public_100_ckpt200_530_8192.pid
 ```
 
 Watch progress:
 
 ```bash
-tail -f logs/eval_public_200_4096.log
+tail -f logs/eval_public_100_ckpt200_530_8192.log
 ```
 
 ## Git Guidance
@@ -115,4 +126,3 @@ Do not commit:
 - `logs/`
 - generated `artifacts/post_training_curriculum/datasets/`
 - generated `artifacts/post_training_curriculum/eval/`
-
