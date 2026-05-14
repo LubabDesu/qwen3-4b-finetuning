@@ -8,6 +8,7 @@ import collections
 import json
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -54,6 +55,25 @@ R2_NOISE_PHRASES = [
 ]
 
 ABRUPT_END_WORDS = {"we", "thus", "therefore", "hence", "so", "but", "and", "or", "then", "method"}
+ABRUPT_END_PHRASES = [
+    "that would mean",
+    "which would mean",
+    "would mean",
+    "that means",
+    "this means",
+    "it means",
+    "the answer would be",
+    "the answer is",
+    "answer is",
+    "we get",
+    "we have",
+    "equals",
+    "is equal to",
+    "hold on",
+    "wait",
+    "let me check",
+    "check my calculations",
+]
 MCQ_ANSWER_RE = re.compile(
     r"(?i)(?:the\s+answer\s+is|answer\s*:|so\s+the\s+answer\s+is|correct\s+answer\s*:?)\s*\(?([A-J])\)?\b"
 )
@@ -61,6 +81,14 @@ THINK_BLOCK_RE = re.compile(r"^\s*<think>\s*(.*?)\s*</think>\s*$", flags=re.S)
 TRAILING_BOX_RE = re.compile(r"\s*\\boxed\s*\{", flags=re.S)
 INLINE_OPTION_RE = re.compile(r"\(([A-J])\)\s*(.*?)(?=(?:\s*\([A-J]\)\s*)|$)", flags=re.S)
 CHINESE_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def log(message: str) -> None:
+    print(f"[stage1_2_r2] {message}", flush=True)
+
+
+def elapsed_seconds(start_time: float) -> str:
+    return f"{time.monotonic() - start_time:.1f}s"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -87,6 +115,12 @@ def normalize_text_answer(text: str) -> str:
 
 def option_labels(n: int) -> list[str]:
     return [chr(65 + i) for i in range(n)]
+
+
+def normalize_mcq_letter_answer(answer: Any) -> str:
+    text = normalize_text_answer(answer).strip().upper()
+    match = re.fullmatch(r"\(?\s*([A-J])\s*\)?", text)
+    return match.group(1) if match else text
 
 
 def format_options(options: Sequence[str] | None) -> str:
@@ -250,6 +284,8 @@ def rendered_token_length(tokenizer: Any, row: dict[str, Any]) -> int:
 def load_tokenizer_for_filter(model_name_or_path: str) -> Any:
     from transformers import AutoTokenizer
 
+    start = time.monotonic()
+    log(f"loading tokenizer for rendered-token filter: {model_name_or_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     eos_candidates = [tokenizer.eos_token, "<|im_end|>", "<|endoftext|>"]
     for token in eos_candidates:
@@ -260,6 +296,7 @@ def load_tokenizer_for_filter(model_name_or_path: str) -> Any:
             tokenizer.eos_token = token
             tokenizer.pad_token = token
             tokenizer.padding_side = "right"
+            log(f"loaded tokenizer in {elapsed_seconds(start)}; eos/pad={token!r}")
             return tokenizer
     raise ValueError("Could not find a valid EOS token in tokenizer vocabulary")
 
@@ -267,6 +304,9 @@ def load_tokenizer_for_filter(model_name_or_path: str) -> Any:
 def ends_abruptly(text: str) -> bool:
     text = str(text or "").strip()
     if not text:
+        return True
+    normalized = re.sub(r"[\s.。,:;，；：!?！？]+$", "", text.lower()).strip()
+    if any(normalized.endswith(phrase) for phrase in ABRUPT_END_PHRASES):
         return True
     last = re.findall(r"[A-Za-z]+", text[-20:])
     return bool(last) and last[-1].lower() in ABRUPT_END_WORDS
@@ -376,6 +416,9 @@ def preview_field(value: Any, limit: int = 180) -> str:
 
 
 def validate_record(row: dict[str, Any]) -> str | None:
+    if CHINESE_CHAR_RE.search(str(row.get("question", ""))):
+        return "chinese_question"
+
     if row.get("source") == ANCHOR_SOURCE:
         target = str(row.get("target", ""))
         if target.count("<think>") != 1 or target.count("</think>") != 1:
@@ -396,7 +439,7 @@ def validate_record(row: dict[str, Any]) -> str | None:
         return "chinese_characters"
     if word_count(reasoning) < 50:
         return "reasoning_too_short"
-    if row.get("is_mcq"):
+    if row.get("is_mcq") or row.get("options"):
         if not re.fullmatch(r"[A-J]", target_answer):
             return "non_letter_mcq_target_answer"
         if not row.get("options"):
@@ -413,29 +456,34 @@ def filter_valid_records(
     drop_counts: collections.Counter[str],
     *,
     max_examples: int = 20,
+    log_every: int = 1000,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     valid: list[dict[str, Any]] = []
     examples: list[dict[str, Any]] = []
+    start = time.monotonic()
 
-    for idx, row in enumerate(records):
+    log(f"validating {len(records)} assembled records")
+    for idx, row in enumerate(records, 1):
         reason = validate_record(row)
         if reason is None:
             valid.append(row)
-            continue
+        else:
+            drop_counts[f"validation:{reason}"] += 1
+            if len(examples) < max_examples:
+                examples.append(
+                    {
+                        "row_index": idx - 1,
+                        "source": row.get("source"),
+                        "original_source": row.get("original_source"),
+                        "reason": reason,
+                        "question_preview": preview_field(row.get("question")),
+                        "answer_preview": preview_field(row.get("answer")),
+                        "target_answer_preview": preview_field(row.get("target_answer", row.get("answer"))),
+                    }
+                )
 
-        drop_counts[f"validation:{reason}"] += 1
-        if len(examples) < max_examples:
-            examples.append(
-                {
-                    "row_index": idx,
-                    "source": row.get("source"),
-                    "original_source": row.get("original_source"),
-                    "reason": reason,
-                    "question_preview": preview_field(row.get("question")),
-                    "answer_preview": preview_field(row.get("answer")),
-                    "target_answer_preview": preview_field(row.get("target_answer", row.get("answer"))),
-                }
-            )
+        if log_every > 0 and (idx % log_every == 0 or idx == len(records)):
+            log(f"validation progress {idx}/{len(records)} kept={len(valid)} elapsed={elapsed_seconds(start)}")
 
     return valid, examples
 
@@ -447,15 +495,19 @@ def filter_rendered_token_lengths(
     tokenizer: Any | None,
     max_rendered_tokens: int | None,
     max_examples: int = 20,
+    log_every: int = 1000,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if tokenizer is None or max_rendered_tokens is None or max_rendered_tokens <= 0:
+        log("rendered-token filter disabled")
         return records, {"enabled": False}
 
     kept: list[dict[str, Any]] = []
     lengths_by_source: dict[str, list[int]] = collections.defaultdict(list)
     examples: list[dict[str, Any]] = []
+    start = time.monotonic()
 
-    for idx, row in enumerate(records):
+    log(f"rendered-token filtering {len(records)} records with max_rendered_tokens={max_rendered_tokens}")
+    for idx, row in enumerate(records, 1):
         source = str(row.get("source", "unknown"))
         try:
             length = rendered_token_length(tokenizer, row)
@@ -464,7 +516,7 @@ def filter_rendered_token_lengths(
             if len(examples) < max_examples:
                 examples.append(
                     {
-                        "row_index": idx,
+                        "row_index": idx - 1,
                         "source": source,
                         "reason": "rendered_tokenize_error",
                         "error": f"{type(exc).__name__}: {str(exc)[:200]}",
@@ -479,7 +531,7 @@ def filter_rendered_token_lengths(
             if len(examples) < max_examples:
                 examples.append(
                     {
-                        "row_index": idx,
+                        "row_index": idx - 1,
                         "source": source,
                         "reason": "rendered_too_long",
                         "rendered_tokens": length,
@@ -492,6 +544,12 @@ def filter_rendered_token_lengths(
         row = dict(row)
         row["rendered_tokens"] = length
         kept.append(row)
+
+        if log_every > 0 and (idx % log_every == 0 or idx == len(records)):
+            log(
+                "rendered-token progress "
+                f"{idx}/{len(records)} kept={len(kept)} dropped={idx - len(kept)} elapsed={elapsed_seconds(start)}"
+            )
 
     stats_by_source: dict[str, dict[str, int]] = {}
     for source, values in lengths_by_source.items():
@@ -537,14 +595,27 @@ def load_openr1_rows(
     *,
     tokenizer: Any | None = None,
     max_rendered_tokens: int | None = None,
+    log_every: int = 1000,
 ) -> list[dict[str, Any]]:
+    start = time.monotonic()
+    log("loading OpenR1 dataset split: open-r1/OpenR1-Math-220k/default train")
     ds = load_dataset("open-r1/OpenR1-Math-220k", "default", split="train")
     rows = list(ds)
+    log(f"loaded OpenR1 rows={len(rows)} in {elapsed_seconds(start)}; shuffling with seed={seed}")
     random.Random(seed).shuffle(rows)
     accepted: list[dict[str, Any]] = []
-    for row in rows:
+    scan_start = time.monotonic()
+    log(f"scanning OpenR1 rows for target={OPENR1_TARGET}")
+    for seen, row in enumerate(rows, 1):
         if len(accepted) >= OPENR1_TARGET:
             break
+        if log_every > 0 and seen % log_every == 0:
+            log(
+                "OpenR1 progress "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{OPENR1_TARGET} "
+                f"drops={sum(v for k, v in drop_counts.items() if k.startswith('openr1:'))} "
+                f"elapsed={elapsed_seconds(scan_start)}"
+            )
         reasoning, reason = choose_openr1_generation(row)
         if reason:
             drop_counts[f"openr1:{reason}"] += 1
@@ -554,9 +625,22 @@ def load_openr1_rows(
             drop_counts["openr1:empty_answer"] += 1
             continue
         question = str(row.get("problem", "")).strip()
+        if CHINESE_CHAR_RE.search(question):
+            drop_counts["openr1:chinese_question"] += 1
+            continue
         options = parse_options(question)
-        is_mcq = bool(options and re.fullmatch(r"[A-J]", answer.upper()))
-        target_answer = answer.upper() if is_mcq else answer
+        if options:
+            answer_letter = normalize_mcq_letter_answer(answer)
+            valid_labels = set(option_labels(len(options)))
+            if answer_letter not in valid_labels:
+                drop_counts["openr1:mcq_answer_not_option_label"] += 1
+                continue
+            answer = answer_letter
+            target_answer = answer_letter
+            is_mcq = True
+        else:
+            target_answer = answer
+            is_mcq = False
         record = {
             "question": question,
             "options": options,
@@ -582,6 +666,14 @@ def load_openr1_rows(
                 continue
             record["rendered_tokens"] = length
         accepted.append(record)
+        if log_every > 0 and len(accepted) >= OPENR1_TARGET:
+            log(
+                "OpenR1 progress "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{OPENR1_TARGET} "
+                f"drops={sum(v for k, v in drop_counts.items() if k.startswith('openr1:'))} "
+                f"elapsed={elapsed_seconds(scan_start)}"
+            )
+    log(f"finished OpenR1 accepted={len(accepted)} elapsed={elapsed_seconds(scan_start)}")
     return accepted
 
 
@@ -591,15 +683,31 @@ def load_mathinstruct_rows(
     *,
     tokenizer: Any | None = None,
     max_rendered_tokens: int | None = None,
+    log_every: int = 1000,
 ) -> list[dict[str, Any]]:
+    start = time.monotonic()
+    log("loading MathInstruct dataset split: TIGER-Lab/MathInstruct train")
     ds = load_dataset("TIGER-Lab/MathInstruct", split="train")
     rows = [row for row in ds if str(row.get("source")) == "data/CoT/aqua_rat.json"]
+    log(f"loaded MathInstruct aqua_rat rows={len(rows)} in {elapsed_seconds(start)}; shuffling with seed={seed}")
     random.Random(seed).shuffle(rows)
     accepted: list[dict[str, Any]] = []
-    for row in rows:
+    scan_start = time.monotonic()
+    log(f"scanning MathInstruct aqua_rat rows for max={MATHINSTRUCT_MAX}")
+    for seen, row in enumerate(rows, 1):
         if len(accepted) >= MATHINSTRUCT_MAX:
             break
+        if log_every > 0 and seen % log_every == 0:
+            log(
+                "MathInstruct progress "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{MATHINSTRUCT_MAX} "
+                f"drops={sum(v for k, v in drop_counts.items() if k.startswith('mathinstruct:'))} "
+                f"elapsed={elapsed_seconds(scan_start)}"
+            )
         question = str(row.get("instruction", "")).strip()
+        if CHINESE_CHAR_RE.search(question):
+            drop_counts["mathinstruct:chinese_question"] += 1
+            continue
         output = str(row.get("output", "")).strip()
         options = parse_options(question)
         answer = extract_mcq_letter(output)
@@ -642,6 +750,14 @@ def load_mathinstruct_rows(
                 continue
             record["rendered_tokens"] = length
         accepted.append(record)
+        if log_every > 0 and len(accepted) >= MATHINSTRUCT_MAX:
+            log(
+                "MathInstruct progress "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{MATHINSTRUCT_MAX} "
+                f"drops={sum(v for k, v in drop_counts.items() if k.startswith('mathinstruct:'))} "
+                f"elapsed={elapsed_seconds(scan_start)}"
+            )
+    log(f"finished MathInstruct accepted={len(accepted)} elapsed={elapsed_seconds(scan_start)}")
     return accepted
 
 
@@ -654,9 +770,18 @@ def build_stage1_2_r2_records(
     force_rebuild: bool = False,
     tokenizer_name_or_path: str | None = None,
     max_rendered_tokens: int | None = DEFAULT_MAX_RENDERED_TOKENS,
+    log_every: int = 1000,
 ) -> list[dict[str, Any]]:
+    build_start = time.monotonic()
+    log(
+        "build requested "
+        f"out_path={out_path} force_rebuild={force_rebuild} "
+        f"tokenizer={tokenizer_name_or_path} max_rendered_tokens={max_rendered_tokens}"
+    )
     if out_path.exists() and not force_rebuild:
-        return load_jsonl(out_path)
+        records = load_jsonl(out_path)
+        log(f"loaded cached records={len(records)} from {out_path}")
+        return records
 
     drop_counts: collections.Counter[str] = collections.Counter()
     tokenizer = load_tokenizer_for_filter(tokenizer_name_or_path) if tokenizer_name_or_path and max_rendered_tokens else None
@@ -665,12 +790,14 @@ def build_stage1_2_r2_records(
         drop_counts,
         tokenizer=tokenizer,
         max_rendered_tokens=max_rendered_tokens,
+        log_every=log_every,
     )
     mathinstruct_records = load_mathinstruct_rows(
         seed + 17,
         drop_counts,
         tokenizer=tokenizer,
         max_rendered_tokens=max_rendered_tokens,
+        log_every=log_every,
     )
 
     if len(openr1_records) < OPENR1_TARGET:
@@ -682,14 +809,20 @@ def build_stage1_2_r2_records(
     if len(selected_mathinstruct) < 1000:
         drop_counts["mathinstruct:shortfall"] += 1000 - len(selected_mathinstruct)
 
+    log(f"loading Stage 0 anchors from {anchor_path}")
     anchors = build_stage0_anchors(load_jsonl(anchor_path), seed=seed + 77, n=ANCHOR_CAP)
     records = openr1_records + selected_mathinstruct + anchors
     random.Random(seed + 123).shuffle(records)
+    log(
+        "assembled records before validation "
+        f"openr1={len(openr1_records)} mathinstruct={len(selected_mathinstruct)} anchors={len(anchors)} total={len(records)}"
+    )
 
     records_before_validation = len(records)
-    records, validation_error_examples = filter_valid_records(records, drop_counts)
+    records, validation_error_examples = filter_valid_records(records, drop_counts, log_every=log_every)
     validation_error_count = records_before_validation - len(records)
     final_records_after_validation = len(records)
+    log(f"validation complete kept={len(records)} dropped={validation_error_count}")
 
     records_before_token_filter = len(records)
     records, token_filter_manifest = filter_rendered_token_lengths(
@@ -697,8 +830,10 @@ def build_stage1_2_r2_records(
         drop_counts,
         tokenizer=tokenizer,
         max_rendered_tokens=max_rendered_tokens,
+        log_every=log_every,
     )
     rendered_token_drop_count = records_before_token_filter - len(records)
+    log(f"rendered-token filtering complete kept={len(records)} dropped={rendered_token_drop_count}")
 
     source_counts = collections.Counter(str(row.get("source", "unknown")) for row in records)
     word_counts_by_source: dict[str, dict[str, int]] = {}
@@ -737,10 +872,13 @@ def build_stage1_2_r2_records(
         "assertions_passed": validation_error_count == 0,
     }
 
+    log(f"writing {len(records)} records to {out_path}")
     write_jsonl(records, out_path)
     if manifest_path is not None:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        log(f"writing manifest to {manifest_path}")
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    log(f"build finished in {elapsed_seconds(build_start)}; final_records={len(records)}")
     return records
 
 
@@ -753,6 +891,7 @@ def main() -> None:
     parser.add_argument("--tokenizer-name-or-path", default=DEFAULT_TOKENIZER_NAME_OR_PATH)
     parser.add_argument("--max-rendered-tokens", type=int, default=DEFAULT_MAX_RENDERED_TOKENS)
     parser.add_argument("--force-rebuild", action="store_true")
+    parser.add_argument("--log-every", type=int, default=1000, help="Print loop progress every N scanned records; use 0 to disable.")
     args = parser.parse_args()
 
     records = build_stage1_2_r2_records(
@@ -763,6 +902,7 @@ def main() -> None:
         force_rebuild=args.force_rebuild,
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         max_rendered_tokens=args.max_rendered_tokens,
+        log_every=args.log_every,
     )
     manifest = json.loads(args.manifest_path.read_text())
     print(f"Built {len(records)} Stage 1-2 r2 records: {args.out_path}")
