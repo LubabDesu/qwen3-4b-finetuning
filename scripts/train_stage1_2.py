@@ -78,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load notebook definitions and Stage 1_2 records, then exit before model loading/training.",
     )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=None,
+        help="Optional Stage 1_2 JSONL dataset path. Overrides the notebook-loaded stage1_2_records.",
+    )
+    parser.add_argument(
+        "--lazy-tokenize",
+        action="store_true",
+        help="Tokenize examples on demand during training instead of materializing all tokenized rows in CPU RAM.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +103,39 @@ def exec_cell(cells: list[dict[str, Any]], cell_id: int, namespace: dict[str, An
     exec(compile(source, filename, "exec"), namespace)
 
 
+def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
+    with path.open() as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def infer_manifest_path(dataset_path: Path) -> Path:
+    name = dataset_path.name
+    if name.endswith("_records.jsonl"):
+        return dataset_path.with_name(name[: -len("_records.jsonl")] + "_manifest.json")
+    if name.endswith(".jsonl"):
+        return dataset_path.with_suffix(".manifest.json")
+    return dataset_path.with_name(dataset_path.name + ".manifest.json")
+
+
+def apply_dataset_override(namespace: dict[str, Any], dataset_path: Path) -> None:
+    if not dataset_path.is_absolute():
+        dataset_path = REPO_ROOT / dataset_path
+    manifest_path = infer_manifest_path(dataset_path)
+    review_path = dataset_path.with_name(dataset_path.stem + "_for_review.json")
+
+    print(f"[stage1_2] overriding Stage 1_2 dataset: {dataset_path}", flush=True)
+    namespace["stage1_2_records"] = load_jsonl_file(dataset_path)
+    namespace["STAGE1_2_PATH"] = dataset_path
+    namespace["STAGE1_2_CLEAN_PATH"] = dataset_path
+    namespace["STAGE1_2_CLEAN_MANIFEST_PATH"] = manifest_path
+    namespace["STAGE1_2_REVIEW_PATH"] = review_path
+    print(f"[stage1_2] loaded override records: {len(namespace['stage1_2_records'])}", flush=True)
+    if manifest_path.exists():
+        print(f"[stage1_2] override manifest: {manifest_path}", flush=True)
+    else:
+        print(f"[stage1_2] override manifest missing: {manifest_path}", flush=True)
+
+
 def load_notebook_namespace(args: argparse.Namespace) -> SimpleNamespace:
     os.chdir(REPO_ROOT)
     cells = load_notebook_cells()
@@ -104,6 +148,9 @@ def load_notebook_namespace(args: argparse.Namespace) -> SimpleNamespace:
     for cell_id in CORE_CELL_IDS:
         print(f"[stage1_2] loading notebook cell {cell_id}", flush=True)
         exec_cell(cells, cell_id, namespace)
+
+    if args.dataset_path is not None:
+        apply_dataset_override(namespace, args.dataset_path)
 
     if not args.skip_preflight:
         print("[stage1_2] running Stage 1_2 preflight", flush=True)
@@ -160,7 +207,45 @@ def backup_path(src: Path, target: str | None, *, label: str) -> None:
 
 
 def train_stage_with_checkpoints(ns: SimpleNamespace, args: argparse.Namespace) -> tuple[Path, Path | None]:
+    import torch
     from transformers import Trainer, TrainerCallback, TrainingArguments
+
+    class LazyTokenizedRecords(torch.utils.data.Dataset):
+        def __init__(self, records, tokenizer, make_features, max_seq_length: int) -> None:  # type: ignore[no-untyped-def]
+            self.records = list(records)
+            self.tokenizer = tokenizer
+            self.make_features = make_features
+            self.max_seq_length = max_seq_length
+            self._valid_indices: list[int] | None = None
+
+        def _ensure_valid_indices(self) -> None:
+            if self._valid_indices is not None:
+                return
+            valid: list[int] = []
+            skipped: list[tuple[int, int, Any]] = []
+            for idx, row in enumerate(self.records):
+                item = self.make_features(self.tokenizer, row)
+                length = len(item["input_ids"])
+                if length > self.max_seq_length:
+                    skipped.append((idx + 1, length, row.get("distill_key")))
+                else:
+                    valid.append(idx)
+            self._valid_indices = valid
+            if skipped:
+                print(f"Skipped {len(skipped)} over-length records; first skipped: {skipped[0]}", flush=True)
+            print(f"Assistant-only train records: {len(valid)} / {len(self.records)}", flush=True)
+            print("[stage1_2] lazy tokenization enabled; tokenized examples are not stored in RAM", flush=True)
+
+        def __len__(self) -> int:
+            self._ensure_valid_indices()
+            assert self._valid_indices is not None
+            return len(self._valid_indices)
+
+        def __getitem__(self, idx: int) -> dict[str, Any]:
+            self._ensure_valid_indices()
+            assert self._valid_indices is not None
+            row = self.records[self._valid_indices[idx]]
+            return self.make_features(self.tokenizer, row)
 
     class BackupOnSaveCallback(TrainerCallback):
         def __init__(self, target: str | None) -> None:
@@ -180,7 +265,15 @@ def train_stage_with_checkpoints(ns: SimpleNamespace, args: argparse.Namespace) 
     print(f"[stage1_2] Loading model for {cfg.name}: {ns.STAGE1_2_BASE_MODEL}", flush=True)
     model, tokenizer = ns.load_model_for_training(ns.STAGE1_2_BASE_MODEL, cfg)
     print(f"[stage1_2] Tokenizer EOS/PAD: {tokenizer.eos_token!r} / {tokenizer.pad_token!r}", flush=True)
-    train_dataset = ns.format_records_with_tokenizer(ns.stage1_2_records, tokenizer)
+    if args.lazy_tokenize:
+        train_dataset = LazyTokenizedRecords(
+            ns.stage1_2_records,
+            tokenizer,
+            ns.make_assistant_only_features,
+            ns.MAX_SEQ_LENGTH,
+        )
+    else:
+        train_dataset = ns.format_records_with_tokenizer(ns.stage1_2_records, tokenizer)
 
     lora_dir = ns.CHECKPOINT_DIR / f"lora_{cfg.name}"
     merged_dir = ns.CHECKPOINT_DIR / f"merged_{cfg.name}"

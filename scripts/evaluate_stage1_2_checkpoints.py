@@ -36,6 +36,21 @@ def parse_args() -> argparse.Namespace:
         help="Checkpoint step numbers to evaluate.",
     )
     parser.add_argument(
+        "--eval-base-model",
+        action="store_true",
+        help="Evaluate the base model directly instead of merging/evaluating Trainer checkpoints.",
+    )
+    parser.add_argument(
+        "--base-model",
+        default=None,
+        help="Base model name/path for --eval-base-model. Defaults to the notebook BASE_MODEL.",
+    )
+    parser.add_argument(
+        "--base-stage-name",
+        default=None,
+        help="Stage name prefix for --eval-base-model outputs. Defaults to base_public or base_eval.",
+    )
+    parser.add_argument(
         "--checkpoint-root",
         type=Path,
         default=Path("checkpoints/trainer_stage1_2"),
@@ -47,6 +62,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional rclone source containing checkpoint-N folders, for example "
             "'gdrive:151B_SP26_Competition/checkpoints/stage1_2/trainer_stage1_2'."
+        ),
+    )
+    parser.add_argument(
+        "--drive-results-target",
+        default=None,
+        help=(
+            "Optional rclone destination for eval result files, for example "
+            "'gdrive:151B_SP26_Competition/eval/stage1_2_public'."
         ),
     )
     parser.add_argument(
@@ -177,11 +200,14 @@ def load_public_eval_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None) -> None:
-    if checkpoint_dir.exists():
+    adapter_path = checkpoint_dir / "adapter_model.safetensors"
+    if adapter_path.exists():
         return
     if not drive_source:
         raise FileNotFoundError(f"Missing local checkpoint and no --drive-source was provided: {checkpoint_dir}")
 
+    if checkpoint_dir.exists():
+        print(f"[checkpoint_eval] local checkpoint exists but is incomplete: {checkpoint_dir}", flush=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     remote = f"{drive_source.rstrip('/')}/{checkpoint_dir.name}"
     print(f"[checkpoint_eval] downloading {remote} -> {checkpoint_dir}", flush=True)
@@ -201,6 +227,39 @@ def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None) -> N
     )
     if result.returncode != 0:
         raise RuntimeError(f"rclone copy failed for {remote} with exit code {result.returncode}")
+    if not adapter_path.exists():
+        raise FileNotFoundError(f"Downloaded checkpoint is missing adapter_model.safetensors: {checkpoint_dir}")
+
+
+def sync_eval_outputs(eval_dir: Path, stage_name: str, drive_results_target: str | None) -> None:
+    if not drive_results_target:
+        return
+
+    paths = sorted(eval_dir.glob(f"{stage_name}_eval_*"))
+    if not paths:
+        print(f"[checkpoint_eval] no eval outputs to sync yet for {stage_name}", flush=True)
+        return
+
+    remote_root = drive_results_target.rstrip("/")
+    for path in paths:
+        remote = f"{remote_root}/{path.name}"
+        print(f"[checkpoint_eval] syncing {path} -> {remote}", flush=True)
+        result = subprocess.run(
+            [
+                "rclone",
+                "copyto",
+                str(path),
+                remote,
+                "--transfers=4",
+                "--checkers=4",
+                "--drive-chunk-size=128M",
+                "--log-level",
+                "INFO",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"rclone copyto failed for {path} with exit code {result.returncode}")
 
 
 def merge_checkpoint(ns: SimpleNamespace, checkpoint_dir: Path, merged_dir: Path) -> Path:
@@ -313,6 +372,28 @@ def main() -> None:
     eval_rows = load_public_eval_rows(args) if args.public_only else ns.eval_set
     args.merged_root.mkdir(parents=True, exist_ok=True)
 
+    if args.eval_base_model:
+        model_name_or_path = args.base_model or ns.BASE_MODEL
+        stage_name = args.base_stage_name or ("base_public" if args.public_only else "base_eval")
+        summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
+        if args.skip_existing and summary_path.exists():
+            print(f"[checkpoint_eval] skipping existing eval summary: {summary_path}", flush=True)
+            return
+
+        try:
+            print(f"[checkpoint_eval] evaluating base model {model_name_or_path} as {stage_name}", flush=True)
+            metrics = ns.evaluate_model(
+                model_name_or_path,
+                stage_name,
+                eval_rows,
+                limit=args.limit,
+                batch_size=args.batch_size,
+            )
+            print(f"[checkpoint_eval] {stage_name} metrics: {metrics}", flush=True)
+        finally:
+            sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target)
+        return
+
     for step in args.steps:
         stage_name = f"stage1_2_public_ckpt_{step}" if args.public_only else f"stage1_2_ckpt_{step}"
         summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
@@ -338,6 +419,7 @@ def main() -> None:
             )
             print(f"[checkpoint_eval] {stage_name} metrics: {metrics}", flush=True)
         finally:
+            sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target)
             if not args.keep_merged and merged_dir.exists():
                 print(f"[checkpoint_eval] removing merged temp model: {merged_dir}", flush=True)
                 shutil.rmtree(merged_dir)

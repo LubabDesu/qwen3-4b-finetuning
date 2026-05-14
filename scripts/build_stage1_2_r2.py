@@ -595,6 +595,7 @@ def load_openr1_rows(
     seed: int,
     drop_counts: collections.Counter[str],
     *,
+    cap: int | None = OPENR1_TARGET,
     tokenizer: Any | None = None,
     max_rendered_tokens: int | None = None,
     log_every: int = 1000,
@@ -607,14 +608,15 @@ def load_openr1_rows(
     random.Random(seed).shuffle(rows)
     accepted: list[dict[str, Any]] = []
     scan_start = time.monotonic()
-    log(f"scanning OpenR1 rows for target={OPENR1_TARGET}")
+    target_label = "uncapped" if cap is None else str(cap)
+    log(f"scanning OpenR1 rows for target={target_label}")
     for seen, row in enumerate(rows, 1):
-        if len(accepted) >= OPENR1_TARGET:
+        if cap is not None and len(accepted) >= cap:
             break
         if log_every > 0 and seen % log_every == 0:
             log(
                 "OpenR1 progress "
-                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{OPENR1_TARGET} "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{target_label} "
                 f"drops={sum(v for k, v in drop_counts.items() if k.startswith('openr1:'))} "
                 f"elapsed={elapsed_seconds(scan_start)}"
             )
@@ -668,10 +670,10 @@ def load_openr1_rows(
                 continue
             record["rendered_tokens"] = length
         accepted.append(record)
-        if log_every > 0 and len(accepted) >= OPENR1_TARGET:
+        if log_every > 0 and cap is not None and len(accepted) >= cap:
             log(
                 "OpenR1 progress "
-                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{OPENR1_TARGET} "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{target_label} "
                 f"drops={sum(v for k, v in drop_counts.items() if k.startswith('openr1:'))} "
                 f"elapsed={elapsed_seconds(scan_start)}"
             )
@@ -683,6 +685,7 @@ def load_mathinstruct_rows(
     seed: int,
     drop_counts: collections.Counter[str],
     *,
+    cap: int | None = MATHINSTRUCT_MAX,
     tokenizer: Any | None = None,
     max_rendered_tokens: int | None = None,
     log_every: int = 1000,
@@ -695,14 +698,15 @@ def load_mathinstruct_rows(
     random.Random(seed).shuffle(rows)
     accepted: list[dict[str, Any]] = []
     scan_start = time.monotonic()
-    log(f"scanning MathInstruct aqua_rat rows for max={MATHINSTRUCT_MAX}")
+    target_label = "uncapped" if cap is None else str(cap)
+    log(f"scanning MathInstruct aqua_rat rows for max={target_label}")
     for seen, row in enumerate(rows, 1):
-        if len(accepted) >= MATHINSTRUCT_MAX:
+        if cap is not None and len(accepted) >= cap:
             break
         if log_every > 0 and seen % log_every == 0:
             log(
                 "MathInstruct progress "
-                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{MATHINSTRUCT_MAX} "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{target_label} "
                 f"drops={sum(v for k, v in drop_counts.items() if k.startswith('mathinstruct:'))} "
                 f"elapsed={elapsed_seconds(scan_start)}"
             )
@@ -752,10 +756,10 @@ def load_mathinstruct_rows(
                 continue
             record["rendered_tokens"] = length
         accepted.append(record)
-        if log_every > 0 and len(accepted) >= MATHINSTRUCT_MAX:
+        if log_every > 0 and cap is not None and len(accepted) >= cap:
             log(
                 "MathInstruct progress "
-                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{MATHINSTRUCT_MAX} "
+                f"seen={seen}/{len(rows)} accepted={len(accepted)}/{target_label} "
                 f"drops={sum(v for k, v in drop_counts.items() if k.startswith('mathinstruct:'))} "
                 f"elapsed={elapsed_seconds(scan_start)}"
             )
@@ -772,13 +776,21 @@ def build_stage1_2_r2_records(
     force_rebuild: bool = False,
     tokenizer_name_or_path: str | None = None,
     max_rendered_tokens: int | None = DEFAULT_MAX_RENDERED_TOKENS,
+    include_stage0_anchors: bool = True,
+    openr1_cap: int | None = OPENR1_TARGET,
+    mathinstruct_cap: int | None = MATHINSTRUCT_MAX,
+    dry_run: bool = False,
     log_every: int = 1000,
 ) -> list[dict[str, Any]]:
     build_start = time.monotonic()
     log(
         "build requested "
         f"out_path={out_path} force_rebuild={force_rebuild} "
-        f"tokenizer={tokenizer_name_or_path} max_rendered_tokens={max_rendered_tokens}"
+        f"tokenizer={tokenizer_name_or_path} max_rendered_tokens={max_rendered_tokens} "
+        f"include_stage0_anchors={include_stage0_anchors} "
+        f"openr1_cap={openr1_cap if openr1_cap is not None else 'uncapped'} "
+        f"mathinstruct_cap={mathinstruct_cap if mathinstruct_cap is not None else 'uncapped'} "
+        f"dry_run={dry_run}"
     )
     if out_path.exists() and not force_rebuild:
         records = load_jsonl(out_path)
@@ -790,6 +802,7 @@ def build_stage1_2_r2_records(
     openr1_records = load_openr1_rows(
         seed,
         drop_counts,
+        cap=openr1_cap,
         tokenizer=tokenizer,
         max_rendered_tokens=max_rendered_tokens,
         log_every=log_every,
@@ -797,22 +810,31 @@ def build_stage1_2_r2_records(
     mathinstruct_records = load_mathinstruct_rows(
         seed + 17,
         drop_counts,
+        cap=mathinstruct_cap,
         tokenizer=tokenizer,
         max_rendered_tokens=max_rendered_tokens,
         log_every=log_every,
     )
 
-    if len(openr1_records) < OPENR1_TARGET:
-        drop_counts["openr1:shortfall"] += OPENR1_TARGET - len(openr1_records)
+    if openr1_cap is not None and len(openr1_records) < openr1_cap:
+        drop_counts["openr1:shortfall"] += openr1_cap - len(openr1_records)
 
     openr1_target = len(openr1_records)
-    mathinstruct_target = min(MATHINSTRUCT_MAX, max(1000, PREFERRED_MIN_ROWS - ANCHOR_CAP - openr1_target))
+    anchor_target = ANCHOR_CAP if include_stage0_anchors else 0
+    if mathinstruct_cap is None:
+        mathinstruct_target = len(mathinstruct_records)
+    else:
+        mathinstruct_target = min(mathinstruct_cap, max(1000, PREFERRED_MIN_ROWS - anchor_target - openr1_target))
     selected_mathinstruct = mathinstruct_records[:mathinstruct_target]
-    if len(selected_mathinstruct) < 1000:
+    if mathinstruct_cap is not None and len(selected_mathinstruct) < 1000:
         drop_counts["mathinstruct:shortfall"] += 1000 - len(selected_mathinstruct)
 
-    log(f"loading Stage 0 anchors from {anchor_path}")
-    anchors = build_stage0_anchors(load_jsonl(anchor_path), seed=seed + 77, n=ANCHOR_CAP)
+    if include_stage0_anchors:
+        log(f"loading Stage 0 anchors from {anchor_path}")
+        anchors = build_stage0_anchors(load_jsonl(anchor_path), seed=seed + 77, n=ANCHOR_CAP)
+    else:
+        log("skipping Stage 0 anchors because include_stage0_anchors=False")
+        anchors = []
     records = openr1_records + selected_mathinstruct + anchors
     random.Random(seed + 123).shuffle(records)
     log(
@@ -852,6 +874,12 @@ def build_stage1_2_r2_records(
 
     manifest = {
         "source_caps": R2_SOURCE_CAPS,
+        "requested_source_caps": {
+            "openr1_default": openr1_cap,
+            "mathinstruct_aqua_rat": mathinstruct_cap,
+        },
+        "include_stage0_anchors": include_stage0_anchors,
+        "stage0_anchor_cap": ANCHOR_CAP,
         "preferred_row_range": [PREFERRED_MIN_ROWS, PREFERRED_MAX_ROWS],
         "minimum_row_count": MIN_ACCEPTED_ROWS,
         "total_records": len(records),
@@ -864,6 +892,7 @@ def build_stage1_2_r2_records(
         "accepted_by_source": {
             "openr1_default": len(openr1_records),
             "mathinstruct_aqua_rat": len(selected_mathinstruct),
+            ANCHOR_SOURCE: len(anchors),
         },
         "drop_counts": dict(drop_counts),
         "validation_error_count": validation_error_count,
@@ -872,10 +901,14 @@ def build_stage1_2_r2_records(
         "anchor_path": str(anchor_path),
         "out_path": str(out_path),
         "assertions_passed": validation_error_count == 0,
+        "dry_run": dry_run,
     }
 
-    log(f"writing {len(records)} records to {out_path}")
-    write_jsonl(records, out_path)
+    if dry_run:
+        log(f"dry run enabled; not writing records to {out_path}")
+    else:
+        log(f"writing {len(records)} records to {out_path}")
+        write_jsonl(records, out_path)
     if manifest_path is not None:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         log(f"writing manifest to {manifest_path}")
@@ -892,9 +925,19 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=151)
     parser.add_argument("--tokenizer-name-or-path", default=DEFAULT_TOKENIZER_NAME_OR_PATH)
     parser.add_argument("--max-rendered-tokens", type=int, default=DEFAULT_MAX_RENDERED_TOKENS)
+    parser.add_argument("--openr1-cap", type=int, default=OPENR1_TARGET, help="Max OpenR1 rows to accept; use 0 for uncapped.")
+    parser.add_argument("--mathinstruct-cap", type=int, default=MATHINSTRUCT_MAX, help="Max MathInstruct aqua_rat rows to accept; use 0 for uncapped.")
     parser.add_argument("--force-rebuild", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Build and write manifest only; do not overwrite the dataset JSONL.")
+    parser.add_argument(
+        "--exclude-stage0-anchors",
+        action="store_true",
+        help="Do not include Stage 0B format-anchor rows in the Stage 1-2 dataset.",
+    )
     parser.add_argument("--log-every", type=int, default=1000, help="Print loop progress every N scanned records; use 0 to disable.")
     args = parser.parse_args()
+    openr1_cap = None if args.openr1_cap == 0 else args.openr1_cap
+    mathinstruct_cap = None if args.mathinstruct_cap == 0 else args.mathinstruct_cap
 
     records = build_stage1_2_r2_records(
         anchor_path=args.anchor_path,
@@ -904,6 +947,10 @@ def main() -> None:
         force_rebuild=args.force_rebuild,
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         max_rendered_tokens=args.max_rendered_tokens,
+        include_stage0_anchors=not args.exclude_stage0_anchors,
+        openr1_cap=openr1_cap,
+        mathinstruct_cap=mathinstruct_cap,
+        dry_run=args.dry_run,
         log_every=args.log_every,
     )
     manifest = json.loads(args.manifest_path.read_text())
