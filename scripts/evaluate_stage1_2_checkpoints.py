@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -39,6 +40,17 @@ def parse_args() -> argparse.Namespace:
         "--eval-base-model",
         action="store_true",
         help="Evaluate the base model directly instead of merging/evaluating Trainer checkpoints.",
+    )
+    parser.add_argument(
+        "--include-base-model",
+        action="store_true",
+        help="Also evaluate the base model in the same run as checkpoint evals.",
+    )
+    parser.add_argument(
+        "--base-position",
+        choices=["first", "last"],
+        default="last",
+        help="When --include-base-model is set, evaluate the base model before or after checkpoints.",
     )
     parser.add_argument(
         "--base-model",
@@ -71,6 +83,29 @@ def parse_args() -> argparse.Namespace:
             "Optional rclone destination for eval result files, for example "
             "'gdrive:151B_SP26_Competition/eval/stage1_2_public'."
         ),
+    )
+    parser.add_argument(
+        "--drive-sync-summaries-only",
+        action="store_true",
+        help="When syncing eval outputs to Drive, upload only summary JSON files.",
+    )
+    parser.add_argument(
+        "--ignore-drive-sync-errors",
+        action="store_true",
+        help="Log rclone sync failures without failing the eval run.",
+    )
+    parser.add_argument("--rclone-transfers", type=int, default=4, help="rclone --transfers value for Drive copies.")
+    parser.add_argument("--rclone-checkers", type=int, default=4, help="rclone --checkers value for Drive copies.")
+    parser.add_argument("--rclone-drive-chunk-size", default="128M", help="rclone --drive-chunk-size value.")
+    parser.add_argument("--rclone-tpslimit", type=float, default=None, help="Optional rclone --tpslimit value.")
+    parser.add_argument("--rclone-tpslimit-burst", type=int, default=None, help="Optional rclone --tpslimit-burst value.")
+    parser.add_argument("--rclone-retries", type=int, default=10, help="rclone --retries value.")
+    parser.add_argument("--rclone-low-level-retries", type=int, default=20, help="rclone --low-level-retries value.")
+    parser.add_argument(
+        "--checkpoint-sleep-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep this many seconds after each checkpoint eval/sync before moving to the next checkpoint.",
     )
     parser.add_argument(
         "--merged-root",
@@ -117,6 +152,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--keep-merged", action="store_true", help="Keep merged checkpoint models after eval.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip evals whose summary JSON already exists.")
+    parser.add_argument(
+        "--resume-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resume from existing *_eval_results.jsonl or *_eval_results.partial.jsonl by skipping completed ids. "
+            "Use --no-resume-existing to force a fresh eval."
+        ),
+    )
     parser.add_argument(
         "--public-only",
         action="store_true",
@@ -181,6 +225,229 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def eval_row_id(row: dict[str, Any], fallback_index: int | None = None) -> str:
+    row_id = row.get("id")
+    if row_id is not None and str(row_id).strip():
+        return str(row_id)
+    if fallback_index is None:
+        raise ValueError(f"Eval/result row is missing id and no fallback index was provided: {row}")
+    return f"__row_index_{fallback_index}"
+
+
+def dedupe_eval_rows(eval_rows: list[dict[str, Any]], stage_name: str) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique_rows: list[dict[str, Any]] = []
+    duplicate_count = 0
+    for index, row in enumerate(eval_rows):
+        row_id = eval_row_id(row, index)
+        if row_id in seen:
+            duplicate_count += 1
+            continue
+        seen.add(row_id)
+        unique_rows.append(row)
+    if duplicate_count:
+        print(
+            f"[checkpoint_eval] {stage_name}: skipped {duplicate_count} duplicate eval input ids",
+            flush=True,
+        )
+    return unique_rows
+
+
+def load_existing_result_rows(eval_dir: Path, stage_name: str) -> list[dict[str, Any]]:
+    paths = [
+        eval_dir / f"{stage_name}_eval_results.jsonl",
+        eval_dir / f"{stage_name}_eval_results.partial.jsonl",
+    ]
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    duplicate_count = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        for row in load_jsonl(path):
+            try:
+                row_id = eval_row_id(row)
+            except ValueError:
+                duplicate_count += 1
+                continue
+            if row_id in rows_by_id:
+                duplicate_count += 1
+                continue
+            rows_by_id[row_id] = row
+    if duplicate_count:
+        print(
+            f"[checkpoint_eval] {stage_name}: ignored {duplicate_count} duplicate/malformed existing result rows",
+            flush=True,
+        )
+    return list(rows_by_id.values())
+
+
+def build_eval_metrics(rows: list[dict[str, Any]], partial: bool = False) -> dict[str, Any]:
+    n = len(rows)
+    correct = sum(int(bool(row.get("correct"))) for row in rows)
+    compliance = sum(int(bool(row.get("format_ok"))) for row in rows)
+    total_words = sum(int(row.get("word_count") or 0) for row in rows)
+    mcq_rows = [row for row in rows if row.get("is_mcq")]
+    multi_rows = [row for row in rows if row.get("is_multi")]
+    metrics: dict[str, Any] = {
+        "n": n,
+        "accuracy": correct / n if n else 0.0,
+        "correct": correct,
+        "mcq_accuracy": (
+            sum(int(bool(row.get("correct"))) for row in mcq_rows) / len(mcq_rows) if mcq_rows else None
+        ),
+        "mcq_total": len(mcq_rows),
+        "multi_answer_accuracy": (
+            sum(int(bool(row.get("correct"))) for row in multi_rows) / len(multi_rows) if multi_rows else None
+        ),
+        "multi_answer_total": len(multi_rows),
+        "avg_response_words": total_words / n if n else 0.0,
+        "boxed_compliance_rate": compliance / n if n else 0.0,
+        "inference_backend": "vllm",
+    }
+    if partial:
+        metrics["partial"] = True
+    return metrics
+
+
+def write_jsonl(rows: list[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def install_resumable_evaluate_model(ns: SimpleNamespace, args: argparse.Namespace) -> None:
+    if not args.resume_existing:
+        return
+
+    def evaluate_model_resumable(
+        model_name_or_path: str,
+        stage_name: str,
+        eval_rows: list[dict[str, Any]] | None = None,
+        limit: int | None = None,
+        batch_size: int = 20,
+        report_every_batches: int = 1,
+        report_examples: int = 2,
+    ) -> dict[str, Any]:
+        if eval_rows is None:
+            eval_path = ns.EVAL_DIR / "heldout_eval_set.jsonl"
+            eval_rows = ns.load_jsonl(eval_path) if eval_path.exists() else ns.build_eval_sets()
+        if limit:
+            eval_rows = eval_rows[:limit]
+        eval_rows = dedupe_eval_rows(eval_rows, stage_name)
+
+        existing_rows = load_existing_result_rows(ns.EVAL_DIR, stage_name)
+        eval_ids = {eval_row_id(row, index) for index, row in enumerate(eval_rows)}
+        existing_by_id = {
+            eval_row_id(row): row
+            for row in existing_rows
+            if eval_row_id(row) in eval_ids
+        }
+        pending_rows = [
+            row
+            for index, row in enumerate(eval_rows)
+            if eval_row_id(row, index) not in existing_by_id
+        ]
+
+        if existing_by_id:
+            print(
+                f"[checkpoint_eval] {stage_name}: resuming with {len(existing_by_id)} completed ids; "
+                f"{len(pending_rows)} remaining",
+                flush=True,
+            )
+
+        if not pending_rows:
+            rows = [existing_by_id[eval_row_id(row, index)] for index, row in enumerate(eval_rows)]
+            metrics = build_eval_metrics(rows)
+            out_path = ns.EVAL_DIR / f"{stage_name}_eval_results.jsonl"
+            summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
+            write_jsonl(rows, out_path)
+            summary_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
+            ns.append_results_log(stage_name, metrics)
+            print(f"[checkpoint_eval] {stage_name}: already complete after resume/dedupe", flush=True)
+            print(json.dumps(metrics, indent=2))
+            return metrics
+
+        llm, tokenizer = ns.load_vllm_engine(model_name_or_path)
+        generated_by_id: dict[str, dict[str, Any]] = {}
+
+        try:
+            for start in ns.tqdm(range(0, len(pending_rows), batch_size), desc=f"Eval {stage_name}"):
+                batch = pending_rows[start : start + batch_size]
+                responses = ns.generate_responses_vllm(
+                    llm,
+                    tokenizer,
+                    batch,
+                    max_new_tokens=ns.EVAL_MAX_NEW_TOKENS,
+                    temperature=ns.EVAL_VLLM_TEMPERATURE,
+                )
+                batch_result_rows = []
+
+                for item_index, (item, response) in enumerate(zip(batch, responses), start=start):
+                    is_mcq = bool(item.get("options"))
+                    is_multi = (not is_mcq) and ns.count_ans_blanks(item.get("question", "")) > 1
+                    if item.get("eval_source") == "public":
+                        ok = ns.score_public_item(item, response)
+                    else:
+                        ok = ns.score_math_item(item, response)
+                    fmt_ok = ns.boxed_format_ok(
+                        item.get("question", ""),
+                        response,
+                        is_mcq=is_mcq,
+                        options=item.get("options"),
+                    )
+                    words = ns.response_word_count(response)
+                    row = {
+                        "id": item.get("id"),
+                        "eval_source": item.get("eval_source"),
+                        "is_mcq": is_mcq,
+                        "is_multi": is_multi,
+                        "question": item.get("question"),
+                        "options": item.get("options"),
+                        "gold": item.get("answer"),
+                        "response": response,
+                        "correct": ok,
+                        "format_ok": fmt_ok,
+                        "word_count": words,
+                    }
+                    generated_by_id[eval_row_id(item, item_index)] = row
+                    batch_result_rows.append(row)
+
+                combined_by_id = {**existing_by_id, **generated_by_id}
+                combined_rows = [
+                    combined_by_id[eval_row_id(row, index)]
+                    for index, row in enumerate(eval_rows)
+                    if eval_row_id(row, index) in combined_by_id
+                ]
+                partial_metrics = build_eval_metrics(combined_rows, partial=True)
+                partial_out_path = ns.EVAL_DIR / f"{stage_name}_eval_results.partial.jsonl"
+                partial_summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.partial.json"
+                write_jsonl(combined_rows, partial_out_path)
+                partial_summary_path.write_text(json.dumps(partial_metrics, indent=2, ensure_ascii=False))
+
+                batch_index = start // batch_size + 1
+                if report_every_batches and batch_index % report_every_batches == 0:
+                    ns.print_eval_batch_report(stage_name, combined_rows, batch_result_rows, max_examples=report_examples)
+                    print(f"  partial results: {partial_out_path}")
+        finally:
+            ns.cleanup_vllm(llm)
+
+        final_by_id = {**existing_by_id, **generated_by_id}
+        rows = [final_by_id[eval_row_id(row, index)] for index, row in enumerate(eval_rows)]
+        metrics = build_eval_metrics(rows)
+        out_path = ns.EVAL_DIR / f"{stage_name}_eval_results.jsonl"
+        summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
+        write_jsonl(rows, out_path)
+        summary_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
+        ns.append_results_log(stage_name, metrics)
+
+        print(json.dumps(metrics, indent=2))
+        return metrics
+
+    ns.evaluate_model = evaluate_model_resumable
+    print("[checkpoint_eval] resume mode enabled: existing result ids will be skipped", flush=True)
+
+
 def load_public_eval_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     import random
 
@@ -199,7 +466,24 @@ def load_public_eval_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     return rows
 
 
-def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None) -> None:
+def rclone_common_args(args: argparse.Namespace) -> list[str]:
+    cmd = [
+        f"--transfers={args.rclone_transfers}",
+        f"--checkers={args.rclone_checkers}",
+        f"--drive-chunk-size={args.rclone_drive_chunk_size}",
+        f"--retries={args.rclone_retries}",
+        f"--low-level-retries={args.rclone_low_level_retries}",
+        "--log-level",
+        "INFO",
+    ]
+    if args.rclone_tpslimit is not None:
+        cmd.append(f"--tpslimit={args.rclone_tpslimit}")
+    if args.rclone_tpslimit_burst is not None:
+        cmd.append(f"--tpslimit-burst={args.rclone_tpslimit_burst}")
+    return cmd
+
+
+def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None, args: argparse.Namespace) -> None:
     adapter_path = checkpoint_dir / "adapter_model.safetensors"
     if adapter_path.exists():
         return
@@ -217,11 +501,7 @@ def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None) -> N
             "copy",
             remote,
             str(checkpoint_dir),
-            "--transfers=4",
-            "--checkers=4",
-            "--drive-chunk-size=128M",
-            "--log-level",
-            "INFO",
+            *rclone_common_args(args),
         ],
         check=False,
     )
@@ -231,11 +511,22 @@ def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None) -> N
         raise FileNotFoundError(f"Downloaded checkpoint is missing adapter_model.safetensors: {checkpoint_dir}")
 
 
-def sync_eval_outputs(eval_dir: Path, stage_name: str, drive_results_target: str | None) -> None:
+def sync_eval_outputs(eval_dir: Path, stage_name: str, drive_results_target: str | None, args: argparse.Namespace) -> None:
     if not drive_results_target:
         return
 
     paths = sorted(eval_dir.glob(f"{stage_name}_eval_*"))
+    if args.drive_sync_summaries_only:
+        paths = [path for path in paths if "_summary" in path.name and path.suffix == ".json"]
+    else:
+        paths = sorted(
+            paths,
+            key=lambda path: (
+                0 if "_summary" in path.name else 1,
+                0 if ".partial" not in path.name else 1,
+                path.name,
+            ),
+        )
     if not paths:
         print(f"[checkpoint_eval] no eval outputs to sync yet for {stage_name}", flush=True)
         return
@@ -250,26 +541,36 @@ def sync_eval_outputs(eval_dir: Path, stage_name: str, drive_results_target: str
                 "copyto",
                 str(path),
                 remote,
-                "--transfers=4",
-                "--checkers=4",
-                "--drive-chunk-size=128M",
-                "--log-level",
-                "INFO",
+                *rclone_common_args(args),
             ],
             check=False,
         )
         if result.returncode != 0:
+            if args.ignore_drive_sync_errors:
+                print(
+                    f"[checkpoint_eval] warning: rclone copyto failed for {path} with exit code {result.returncode}",
+                    flush=True,
+                )
+                continue
             raise RuntimeError(f"rclone copyto failed for {path} with exit code {result.returncode}")
 
 
 def merge_checkpoint(ns: SimpleNamespace, checkpoint_dir: Path, merged_dir: Path) -> Path:
-    if (merged_dir / "model.safetensors.index.json").exists() or any(merged_dir.glob("model-*.safetensors")):
-        print(f"[checkpoint_eval] using existing merged model: {merged_dir}", flush=True)
+    has_model_weights = (merged_dir / "model.safetensors.index.json").exists() or any(
+        merged_dir.glob("model-*.safetensors")
+    )
+    has_tokenizer = (merged_dir / "tokenizer.json").exists() and (merged_dir / "tokenizer_config.json").exists()
+    has_config = (merged_dir / "config.json").exists()
+    if has_model_weights and has_tokenizer and has_config:
+        print(f"[checkpoint_eval] using existing merged model: {merged_dir.resolve()}", flush=True)
         return merged_dir
+    if merged_dir.exists():
+        print(f"[checkpoint_eval] removing incomplete merged model before retry: {merged_dir}", flush=True)
+        shutil.rmtree(merged_dir)
 
     from unsloth import FastLanguageModel
 
-    print(f"[checkpoint_eval] merging {checkpoint_dir} -> {merged_dir}", flush=True)
+    print(f"[checkpoint_eval] merging {checkpoint_dir} -> {merged_dir.resolve()}", flush=True)
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=str(checkpoint_dir),
         max_seq_length=ns.MAX_SEQ_LENGTH,
@@ -334,7 +635,8 @@ def apply_vllm_overrides(ns: SimpleNamespace, args: argparse.Namespace) -> None:
         from transformers import AutoTokenizer
         from vllm import LLM
 
-        model_path = str(model_name_or_path)
+        model_path_obj = Path(model_name_or_path)
+        model_path = str(model_path_obj.resolve()) if model_path_obj.exists() else str(model_name_or_path)
         if Path(model_path).exists():
             ns.fix_tokenizer_regex(model_path)
 
@@ -360,6 +662,28 @@ def apply_vllm_overrides(ns: SimpleNamespace, args: argparse.Namespace) -> None:
     print(f"[checkpoint_eval] VLLM max_num_seqs={args.max_num_seqs}", flush=True)
 
 
+def evaluate_base_model(ns: SimpleNamespace, args: argparse.Namespace, eval_rows: list[dict[str, Any]]) -> None:
+    model_name_or_path = args.base_model or ns.BASE_MODEL
+    stage_name = args.base_stage_name or ("base_public" if args.public_only else "base_eval")
+    summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
+    if args.skip_existing and summary_path.exists():
+        print(f"[checkpoint_eval] skipping existing eval summary: {summary_path}", flush=True)
+        return
+
+    try:
+        print(f"[checkpoint_eval] evaluating base model {model_name_or_path} as {stage_name}", flush=True)
+        metrics = ns.evaluate_model(
+            model_name_or_path,
+            stage_name,
+            eval_rows,
+            limit=args.limit,
+            batch_size=args.batch_size,
+        )
+        print(f"[checkpoint_eval] {stage_name} metrics: {metrics}", flush=True)
+    finally:
+        sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target, args)
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -369,30 +693,16 @@ def main() -> None:
     args = parse_args()
     ns = load_eval_namespace()
     apply_vllm_overrides(ns, args)
+    install_resumable_evaluate_model(ns, args)
     eval_rows = load_public_eval_rows(args) if args.public_only else ns.eval_set
     args.merged_root.mkdir(parents=True, exist_ok=True)
 
     if args.eval_base_model:
-        model_name_or_path = args.base_model or ns.BASE_MODEL
-        stage_name = args.base_stage_name or ("base_public" if args.public_only else "base_eval")
-        summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
-        if args.skip_existing and summary_path.exists():
-            print(f"[checkpoint_eval] skipping existing eval summary: {summary_path}", flush=True)
-            return
-
-        try:
-            print(f"[checkpoint_eval] evaluating base model {model_name_or_path} as {stage_name}", flush=True)
-            metrics = ns.evaluate_model(
-                model_name_or_path,
-                stage_name,
-                eval_rows,
-                limit=args.limit,
-                batch_size=args.batch_size,
-            )
-            print(f"[checkpoint_eval] {stage_name} metrics: {metrics}", flush=True)
-        finally:
-            sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target)
+        evaluate_base_model(ns, args, eval_rows)
         return
+
+    if args.include_base_model and args.base_position == "first":
+        evaluate_base_model(ns, args, eval_rows)
 
     for step in args.steps:
         stage_name = f"stage1_2_public_ckpt_{step}" if args.public_only else f"stage1_2_ckpt_{step}"
@@ -402,7 +712,7 @@ def main() -> None:
             continue
 
         checkpoint_dir = args.checkpoint_root / f"checkpoint-{step}"
-        ensure_local_checkpoint(checkpoint_dir, args.drive_source)
+        ensure_local_checkpoint(checkpoint_dir, args.drive_source, args)
         if not (checkpoint_dir / "adapter_model.safetensors").exists():
             raise FileNotFoundError(f"Checkpoint is missing adapter_model.safetensors: {checkpoint_dir}")
 
@@ -419,11 +729,20 @@ def main() -> None:
             )
             print(f"[checkpoint_eval] {stage_name} metrics: {metrics}", flush=True)
         finally:
-            sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target)
+            sync_eval_outputs(ns.EVAL_DIR, stage_name, args.drive_results_target, args)
             if not args.keep_merged and merged_dir.exists():
                 print(f"[checkpoint_eval] removing merged temp model: {merged_dir}", flush=True)
                 shutil.rmtree(merged_dir)
                 gc.collect()
+            if args.checkpoint_sleep_seconds > 0:
+                print(
+                    f"[checkpoint_eval] sleeping {args.checkpoint_sleep_seconds:g}s before next checkpoint",
+                    flush=True,
+                )
+                time.sleep(args.checkpoint_sleep_seconds)
+
+    if args.include_base_model and args.base_position == "last":
+        evaluate_base_model(ns, args, eval_rows)
 
 
 if __name__ == "__main__":

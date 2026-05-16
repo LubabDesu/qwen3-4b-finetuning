@@ -61,6 +61,7 @@ xgrammar==0.1.34
 
 # Notebook/script utility dependencies used by this repo.
 anthropic==0.97.0
+antlr4-python3-runtime==4.11.1
 gdown==6.0.0
 ipykernel==6.26.0
 ipywidgets==8.1.1
