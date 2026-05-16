@@ -179,6 +179,18 @@ def parse_args() -> argparse.Namespace:
         help="Deterministically sample N public rows before applying --limit.",
     )
     parser.add_argument("--public-seed", type=int, default=42, help="Seed for deterministic public sampling.")
+    parser.add_argument(
+        "--public-mcq-n",
+        type=int,
+        default=None,
+        help="Sample exactly this many MCQ (options-bearing) rows from public eval.",
+    )
+    parser.add_argument(
+        "--public-non-mcq-n",
+        type=int,
+        default=None,
+        help="Sample exactly this many non-MCQ rows from public eval.",
+    )
     return parser.parse_args()
 
 
@@ -453,14 +465,31 @@ def load_public_eval_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     rows = load_jsonl(args.public_path)
     rows = [{"eval_source": "public", **row} for row in rows]
-    if args.public_sample_size is not None and args.public_sample_size < len(rows):
+
+    if args.public_mcq_n is not None or args.public_non_mcq_n is not None:
+        rng = random.Random(args.public_seed)
+        mcq = [r for r in rows if r.get("options")]
+        non_mcq = [r for r in rows if not r.get("options")]
+        rng.shuffle(mcq)
+        rng.shuffle(non_mcq)
+        sampled = []
+        if args.public_mcq_n is not None:
+            sampled += mcq[: args.public_mcq_n]
+        if args.public_non_mcq_n is not None:
+            sampled += non_mcq[: args.public_non_mcq_n]
+        rng.shuffle(sampled)
+        rows = sampled
+    elif args.public_sample_size is not None and args.public_sample_size < len(rows):
         rng = random.Random(args.public_seed)
         rows = rng.sample(rows, args.public_sample_size)
+
     if args.limit:
         rows = rows[: args.limit]
+    mcq_count = sum(1 for r in rows if r.get("options"))
     print(
         "[checkpoint_eval] public eval rows "
-        f"path={args.public_path} n={len(rows)} sample_size={args.public_sample_size} seed={args.public_seed}",
+        f"path={args.public_path} n={len(rows)} mcq={mcq_count} non_mcq={len(rows)-mcq_count} "
+        f"sample_size={args.public_sample_size} seed={args.public_seed}",
         flush=True,
     )
     return rows
