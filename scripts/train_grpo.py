@@ -36,6 +36,7 @@ from judger import Judger  # noqa: E402
 # ── Constants ────────────────────────────────────────────────────────────────
 
 FILTERED_DATA_PATH = ROOT / "artifacts" / "grpo" / "filtered_problems.jsonl"
+DEEPMATH_FILTERED_DATA_PATH = ROOT / "artifacts" / "grpo" / "deepmath_filtered_problems.jsonl"
 CHECKPOINT_DIR = ROOT / "checkpoints" / "grpo"
 DRIVE_CHECKPOINT_DIR = Path("/content/drive/MyDrive/151B_SP26_Competition/checkpoints/grpo")
 EVAL_DATA_PATH = ROOT / "heldout_eval_set.jsonl"
@@ -76,9 +77,9 @@ def build_prompt(question: str) -> str:
 
 # ── Curriculum dataset construction ─────────────────────────────────────────
 
-def load_filtered_problems() -> list[dict]:
+def load_filtered_problems(path: Path = FILTERED_DATA_PATH) -> list[dict]:
     problems = []
-    with open(FILTERED_DATA_PATH) as f:
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -433,8 +434,9 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # Load problems and build curriculum dataset
-    problems = load_filtered_problems()
-    print(f"Loaded {len(problems)} filtered problems")
+    data_path = DEEPMATH_FILTERED_DATA_PATH if args.deepmath_only else FILTERED_DATA_PATH
+    problems = load_filtered_problems(data_path)
+    print(f"Loaded {len(problems)} filtered problems from {data_path}")
 
     # Effective prompts per step: per_device * n_devices (approximate with 1 device here)
     batch_per_step = args.per_device_batch_size
@@ -527,6 +529,11 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--deepmath-only",
+        action="store_true",
+        help=f"Train using only DeepMath filtered data from {DEEPMATH_FILTERED_DATA_PATH}",
     )
     parser.add_argument(
         "--gdrive-remote",
