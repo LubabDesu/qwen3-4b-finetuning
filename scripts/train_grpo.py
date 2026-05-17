@@ -37,6 +37,7 @@ from judger import Judger  # noqa: E402
 
 FILTERED_DATA_PATH = ROOT / "artifacts" / "grpo" / "filtered_problems.jsonl"
 DEEPMATH_FILTERED_DATA_PATH = ROOT / "artifacts" / "grpo" / "deepmath_filtered_problems.jsonl"
+INFERENCE_PARTIAL_DATA_PATH = ROOT / "artifacts" / "grpo" / "inference_filtered_problems_partial.jsonl"
 CHECKPOINT_DIR = ROOT / "checkpoints" / "grpo"
 DRIVE_CHECKPOINT_DIR = Path("/content/drive/MyDrive/151B_SP26_Competition/checkpoints/grpo")
 EVAL_DATA_PATH = ROOT / "heldout_eval_set.jsonl"
@@ -84,6 +85,21 @@ def load_filtered_problems(path: Path = FILTERED_DATA_PATH) -> list[dict]:
             line = line.strip()
             if line:
                 problems.append(json.loads(line))
+    return problems
+
+
+def load_deepmath_plus_partial() -> list[dict]:
+    problems = load_filtered_problems(DEEPMATH_FILTERED_DATA_PATH)
+    print(f"Loaded {len(problems)} DeepMath problems from {DEEPMATH_FILTERED_DATA_PATH}")
+    if INFERENCE_PARTIAL_DATA_PATH.exists():
+        partial_problems = load_filtered_problems(INFERENCE_PARTIAL_DATA_PATH)
+        problems.extend(partial_problems)
+        print(
+            f"Loaded {len(partial_problems)} partial inference problems from "
+            f"{INFERENCE_PARTIAL_DATA_PATH}"
+        )
+    else:
+        print(f"No partial inference file found at {INFERENCE_PARTIAL_DATA_PATH}")
     return problems
 
 
@@ -434,9 +450,12 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # Load problems and build curriculum dataset
-    data_path = DEEPMATH_FILTERED_DATA_PATH if args.deepmath_only else FILTERED_DATA_PATH
-    problems = load_filtered_problems(data_path)
-    print(f"Loaded {len(problems)} filtered problems from {data_path}")
+    if args.deepmath_only:
+        problems = load_deepmath_plus_partial()
+        print(f"Loaded {len(problems)} total problems for DeepMath-only mode")
+    else:
+        problems = load_filtered_problems(FILTERED_DATA_PATH)
+        print(f"Loaded {len(problems)} filtered problems from {FILTERED_DATA_PATH}")
 
     # Effective prompts per step: per_device * n_devices (approximate with 1 device here)
     batch_per_step = args.per_device_batch_size
@@ -448,7 +467,7 @@ def main(args: argparse.Namespace) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # GRPOConfig — TRL 0.12 parameter names
+    # GRPOConfig uses completion length naming for generation tokens.
     grpo_config = GRPOConfig(
         output_dir=str(CHECKPOINT_DIR),
         run_name=args.run_name,
@@ -458,7 +477,7 @@ def main(args: argparse.Namespace) -> None:
         num_generations=args.group_size,    # rollouts per prompt
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
-        max_new_tokens=MAX_NEW_TOKENS,
+        max_completion_length=MAX_NEW_TOKENS,
         max_steps=TOTAL_STEPS,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
@@ -490,7 +509,7 @@ def main(args: argparse.Namespace) -> None:
         args=grpo_config,
         train_dataset=dataset,
         reward_funcs=[reward_fn],
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         callbacks=callbacks,
     )
 

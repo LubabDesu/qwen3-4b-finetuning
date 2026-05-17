@@ -1,7 +1,10 @@
 .venv/
+.venv_grpo/
 __pycache__/
 *.py[cod]
 unsloth_compiled_cache/
 artifacts/post_training_curriculum/datasets/
 artifacts/post_training_curriculum/eval/
 checkpoints/
+logs/
+wandb/
