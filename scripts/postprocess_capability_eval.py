@@ -197,24 +197,28 @@ def parse_numeric(value: str) -> float | None:
     text = text.replace(",", "")
     if not re.search(r"\d", text):
         return None
+    
+    # fast path - try direct float first
     try:
         return float(text)
     except ValueError:
         pass
-
-    # Avoid sending very large prose/symbolic option strings into LaTeX parsing.
-    if len(text) > 80 or re.search(r"[A-Za-z]{2,}", text.replace("\\frac", "").replace("\\sqrt", "")):
+    
+    # skip sympy for obviously symbolic expressions
+    # only call sympy if it looks like a simple latex fraction/sqrt
+    if len(text) > 80:
         return None
-
+    if re.search(r"[A-Za-z]{3,}", text.replace("\\frac", "").replace("\\sqrt", "").replace("\\pi", "")):
+        return None
+    
+    # only now call expensive sympy
     try:
         import sympy as sp
         from sympy.parsing.latex import parse_latex
-
         expr = parse_latex(text)
         return float(sp.N(expr.subs(parse_latex("\\pi"), math.pi)))
     except Exception:
         return None
-
 
 class Timeout:
     def __init__(self, seconds: int):
@@ -489,6 +493,28 @@ def expand_inputs(values: list[str]) -> list[Path]:
     return paths
 
 
+def print_summary_table(reports: list[dict[str, Any]]) -> None:
+    col_w = 42
+    print("\n" + "=" * 100, flush=True)
+    print(f"{'FILE':<{col_w}}  {'N':>5}  {'STRICT':>7}  {'CAPAB':>7}  {'RESCUED':>7}  {'MCQ_CAP':>8}  {'NON-MCQ_CAP':>11}", flush=True)
+    print("-" * 100, flush=True)
+    for r in reports:
+        name = Path(r["input_path"]).stem.replace("_eval_results", "")
+        n = r["n"]
+        strict = r["strict_accuracy"]
+        cap = r["capability_accuracy"]
+        rescued = r["rescued_count"]
+        mcq_cap = r.get("splits", {}).get("mcq", {}).get("capability_accuracy")
+        non_mcq_cap = r.get("splits", {}).get("non_mcq", {}).get("capability_accuracy")
+        mcq_str = f"{mcq_cap:.1%}" if mcq_cap is not None else "  —  "
+        non_mcq_str = f"{non_mcq_cap:.1%}" if non_mcq_cap is not None else "  —  "
+        print(
+            f"{name:<{col_w}}  {n:>5}  {strict:>7.1%}  {cap:>7.1%}  {rescued:>7}  {mcq_str:>8}  {non_mcq_str:>11}",
+            flush=True,
+        )
+    print("=" * 100 + "\n", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Rescore eval result JSONL files with capability-oriented postprocessing.")
     parser.add_argument(
@@ -514,8 +540,10 @@ def main() -> None:
     if not paths:
         raise FileNotFoundError("No eval result JSONL files matched the requested inputs.")
 
-    reports = [
-        process_file(
+    print(f"[postprocess] processing {len(paths)} file(s)", flush=True)
+    reports: list[dict[str, Any]] = []
+    for path in paths:
+        report = process_file(
             path,
             abs_tol=args.abs_tol,
             rel_tol=args.rel_tol,
@@ -523,15 +551,27 @@ def main() -> None:
             row_timeout_seconds=args.row_timeout_seconds,
             show_progress=args.progress,
         )
-        for path in paths
-    ]
-    report = aggregate_reports(reports)
+        reports.append(report)
+        mcq_s = report.get("splits", {}).get("mcq", {})
+        non_mcq_s = report.get("splits", {}).get("non_mcq", {})
+        print(
+            f"[postprocess] {path.name}: n={report['n']} "
+            f"strict={report['strict_accuracy']:.1%} capability={report['capability_accuracy']:.1%} "
+            f"rescued={report['rescued_count']} "
+            f"mcq_cap={mcq_s.get('capability_accuracy', 0):.1%}({mcq_s.get('n', 0)}) "
+            f"non_mcq_cap={non_mcq_s.get('capability_accuracy', 0):.1%}({non_mcq_s.get('n', 0)})",
+            flush=True,
+        )
 
-    text = json.dumps(report, indent=2, ensure_ascii=False)
-    print(text)
+    if len(reports) > 1:
+        print_summary_table(reports)
+
+    report = aggregate_reports(reports)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(report, indent=2, ensure_ascii=False)
         args.out.write_text(text + "\n")
+        print(f"[postprocess] report saved to {args.out}", flush=True)
 
 
 if __name__ == "__main__":
