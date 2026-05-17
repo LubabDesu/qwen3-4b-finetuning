@@ -8,6 +8,7 @@ Usage:
 Reads artifacts/grpo/filtered_problems.jsonl produced by filter_grpo_data.py.
 Saves checkpoints to checkpoints/grpo/ every 100 steps.
 Backs up to Google Drive via rclone after each checkpoint.
+Use --use-drive-path to copy checkpoints directly to mounted Google Drive.
 """
 
 import argparse
@@ -15,6 +16,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +37,7 @@ from judger import Judger  # noqa: E402
 
 FILTERED_DATA_PATH = ROOT / "artifacts" / "grpo" / "filtered_problems.jsonl"
 CHECKPOINT_DIR = ROOT / "checkpoints" / "grpo"
+DRIVE_CHECKPOINT_DIR = Path("/content/drive/MyDrive/151B_SP26_Competition/checkpoints/grpo")
 EVAL_DATA_PATH = ROOT / "heldout_eval_set.jsonl"
 
 SYSTEM_PROMPT = (
@@ -320,9 +323,10 @@ class StopConditionCallback(TrainerCallback):
 class RcloneBackupCallback(TrainerCallback):
     """Syncs checkpoint directory to Google Drive after each save."""
 
-    def __init__(self, gdrive_remote: str, local_dir: Path) -> None:
+    def __init__(self, gdrive_remote: str, local_dir: Path, use_drive_path: bool = False) -> None:
         self.gdrive_remote = gdrive_remote
         self.local_dir = local_dir
+        self.use_drive_path = use_drive_path
 
     def on_save(
         self,
@@ -333,6 +337,17 @@ class RcloneBackupCallback(TrainerCallback):
     ) -> None:
         step = state.global_step
         checkpoint_path = self.local_dir / f"checkpoint-{step}"
+        if self.use_drive_path:
+            target_path = DRIVE_CHECKPOINT_DIR / f"checkpoint-{step}"
+            print(f"\n[drive] Copying checkpoint-{step} to {target_path}...")
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(checkpoint_path, target_path, dirs_exist_ok=True)
+                print("[drive] Backup complete.")
+            except Exception as exc:
+                print(f"[drive] Warning: backup failed: {exc}")
+            return
+
         cmd = [
             "rclone", "copy",
             str(checkpoint_path),
@@ -458,8 +473,14 @@ def main(args: argparse.Namespace) -> None:
         StopConditionCallback(eval_steps=EVAL_STEPS),
         EvalAccuracyCallback(eval_steps=EVAL_STEPS),
     ]
-    if args.gdrive_remote:
-        callbacks.append(RcloneBackupCallback(args.gdrive_remote, CHECKPOINT_DIR))
+    if args.use_drive_path or args.gdrive_remote:
+        callbacks.append(
+            RcloneBackupCallback(
+                args.gdrive_remote,
+                CHECKPOINT_DIR,
+                use_drive_path=args.use_drive_path,
+            )
+        )
 
     # Trainer
     trainer = GRPOTrainer(
@@ -511,6 +532,11 @@ if __name__ == "__main__":
         "--gdrive-remote",
         default="gdrive:151B",
         help="rclone remote:path for checkpoint backup (empty to disable)",
+    )
+    parser.add_argument(
+        "--use-drive-path",
+        action="store_true",
+        help=f"Copy checkpoints directly to mounted Drive path: {DRIVE_CHECKPOINT_DIR}",
     )
     args = parser.parse_args()
     main(args)
