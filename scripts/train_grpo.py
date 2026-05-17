@@ -15,6 +15,7 @@ import argparse
 import collections
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -26,7 +27,16 @@ import numpy as np
 import torch
 import wandb
 from datasets import Dataset
-from transformers import AutoTokenizer, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments,
+)
 from trl import GRPOConfig, GRPOTrainer
 
 ROOT = Path(__file__).parent.parent
@@ -42,10 +52,13 @@ CHECKPOINT_DIR = ROOT / "checkpoints" / "grpo"
 DRIVE_CHECKPOINT_DIR = Path("/content/drive/MyDrive/151B_SP26_Competition/checkpoints/grpo")
 EVAL_DATA_PATH = ROOT / "heldout_eval_set.jsonl"
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. Think step by step, "
-    "then give your final answer inside \\boxed{}."
-)
+SYSTEM_PROMPTS = [
+    "You are a helpful assistant. Think step by step, then give your final answer inside \\boxed{}.",
+    "Solve the problem carefully. Show your reasoning, and put the final answer in \\boxed{}.",
+    "Work through the math step by step. Your final response must include the answer in \\boxed{}.",
+    "Reason clearly before answering. Finish with the final answer written inside \\boxed{}.",
+    "Analyze the problem and compute the answer. The final answer must be enclosed in \\boxed{}.",
+]
 
 TOTAL_STEPS = 1000
 EVAL_STEPS = 50
@@ -69,8 +82,9 @@ _loose_judger = Judger(strict_extract=False)
 # ── Prompt formatting ────────────────────────────────────────────────────────
 
 def build_prompt(question: str) -> str:
+    system_prompt = random.choice(SYSTEM_PROMPTS)
     return (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -460,19 +474,64 @@ def main(args: argparse.Namespace) -> None:
     # Effective prompts per step: per_device * n_devices (approximate with 1 device here)
     batch_per_step = args.per_device_batch_size
     dataset = build_curriculum_dataset(problems, TOTAL_STEPS, batch_per_step)
+    print("Dataset built")
     print(f"Built curriculum dataset: {len(dataset)} rows")
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    print("Tokenizer loaded")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    if args.no_quantize:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+    else:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     # GRPOConfig uses completion length naming for generation tokens.
     grpo_config = GRPOConfig(
         output_dir=str(CHECKPOINT_DIR),
         run_name=args.run_name,
         learning_rate=LR,
-        per_device_train_batch_size=args.per_device_batch_size,
+        per_device_train_batch_size=args.group_size,
         gradient_accumulation_steps=args.grad_accum,
         num_generations=args.group_size,    # rollouts per prompt
         temperature=TEMPERATURE,
@@ -488,6 +547,7 @@ def main(args: argparse.Namespace) -> None:
         remove_unused_columns=False,        # keep gold_answer, options columns
         seed=42,
     )
+    print("Config created")
 
     # Callbacks
     callbacks = [
@@ -505,19 +565,21 @@ def main(args: argparse.Namespace) -> None:
 
     # Trainer
     trainer = GRPOTrainer(
-        model=args.model,
+        model=model,
         args=grpo_config,
         train_dataset=dataset,
         reward_funcs=[reward_fn],
         processing_class=tokenizer,
         callbacks=callbacks,
     )
+    print("Trainer created")
 
     print(f"Starting GRPO training: {args.model}")
     print(f"  group_size={args.group_size}, lr={LR}, kl_coef={KL_COEF}")
     print(f"  max_new_tokens={MAX_NEW_TOKENS}, total_steps={TOTAL_STEPS}")
     print(f"  eval every {EVAL_STEPS} steps, save every {SAVE_STEPS} steps")
 
+    print("Starting training...")
     trainer.train()
     wandb.finish()
     print("Training complete.")
@@ -553,6 +615,11 @@ if __name__ == "__main__":
         "--deepmath-only",
         action="store_true",
         help=f"Train using only DeepMath filtered data from {DEEPMATH_FILTERED_DATA_PATH}",
+    )
+    parser.add_argument(
+        "--no-quantize",
+        action="store_true",
+        help="Load the model directly in bfloat16 instead of 4-bit quantization",
     )
     parser.add_argument(
         "--gdrive-remote",
