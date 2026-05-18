@@ -506,6 +506,7 @@ def main(args: argparse.Namespace) -> None:
         per_device_train_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
         num_generations=args.group_size,    # rollouts per prompt
+        generation_batch_size=args.group_size,
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
         max_completion_length=args.max_new_tokens,
