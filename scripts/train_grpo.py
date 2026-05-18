@@ -498,16 +498,6 @@ def main(args: argparse.Namespace) -> None:
         task_type="CAUSAL_LM",
     )
 
-    vllm_config_kwargs = {
-        "use_vllm": True,
-        "vllm_mode": "colocate",
-        "vllm_gpu_memory_utilization": args.vllm_gpu_mem,
-    }
-    if "vllm_max_model_length" in GRPOConfig.__dataclass_fields__:
-        vllm_config_kwargs["vllm_max_model_length"] = args.vllm_max_len
-    else:
-        vllm_config_kwargs["vllm_max_model_len"] = args.vllm_max_len
-
     # GRPOConfig uses completion length naming for generation tokens.
     grpo_config = GRPOConfig(
         output_dir=str(CHECKPOINT_DIR),
@@ -517,20 +507,19 @@ def main(args: argparse.Namespace) -> None:
         gradient_accumulation_steps=args.grad_accum,
         num_generations=args.group_size,    # rollouts per prompt
         generation_batch_size=args.group_size,
+        max_prompt_length=1024,
+        max_completion_length=args.max_new_tokens,
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
-        max_completion_length=args.max_new_tokens,
-        **vllm_config_kwargs,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=args.vllm_gpu_mem,
         max_steps=args.max_steps,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
         report_to="wandb",
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
-        model_init_kwargs={
-            "torch_dtype": torch.bfloat16,
-            "trust_remote_code": True,
-        },
         dataloader_num_workers=0,
         remove_unused_columns=False,        # keep gold_answer, options columns
         seed=42,
@@ -611,15 +600,6 @@ if __name__ == "__main__":
         type=float,
         default=0.6,
         help="GPU memory utilization target for colocated vLLM",
-    )
-    parser.add_argument(
-        "--vllm-max-len",
-        "--vllm-max-model-length",
-        "--vllm-max-model_length",
-        dest="vllm_max_len",
-        type=int,
-        default=16384,
-        help="Maximum model context length for colocated vLLM",
     )
     parser.add_argument(
         "--deepmath-only",
