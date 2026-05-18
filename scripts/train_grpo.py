@@ -537,7 +537,7 @@ def main(args: argparse.Namespace) -> None:
         output_dir=str(CHECKPOINT_DIR),
         run_name=args.run_name,
         learning_rate=LR,
-        per_device_train_batch_size=args.group_size,
+        per_device_train_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
         num_generations=args.group_size,    # rollouts per prompt
         temperature=TEMPERATURE,
