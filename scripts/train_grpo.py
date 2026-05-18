@@ -27,11 +27,9 @@ import numpy as np
 import torch
 import wandb
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     TrainerCallback,
     TrainerControl,
     TrainerState,
@@ -458,7 +456,7 @@ def main(args: argparse.Namespace) -> None:
             "temperature": TEMPERATURE,
             "kl_coef": KL_COEF,
             "group_size": args.group_size,
-            "total_steps": TOTAL_STEPS,
+            "total_steps": args.max_steps,
             "max_new_tokens": args.max_new_tokens,
         },
     )
@@ -471,9 +469,9 @@ def main(args: argparse.Namespace) -> None:
         problems = load_filtered_problems(FILTERED_DATA_PATH)
         print(f"Loaded {len(problems)} filtered problems from {FILTERED_DATA_PATH}")
 
-    # Effective prompts per step: per_device * n_devices (approximate with 1 device here)
-    batch_per_step = args.per_device_batch_size
-    dataset = build_curriculum_dataset(problems, TOTAL_STEPS, batch_per_step)
+    # One prompt per step; GRPO samples num_generations completions for that prompt.
+    batch_per_step = 1
+    dataset = build_curriculum_dataset(problems, args.max_steps, batch_per_step)
     print("Dataset built")
     print(f"Built curriculum dataset: {len(dataset)} rows")
 
@@ -483,37 +481,7 @@ def main(args: argparse.Namespace) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if args.no_quantize:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-    else:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=args.gradient_checkpointing,
-            gradient_checkpointing_kwargs=(
-                {"use_reentrant": False} if args.gradient_checkpointing else None
-            ),
-        )
-
-    lora_config = LoraConfig(
+    peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=[
@@ -529,8 +497,6 @@ def main(args: argparse.Namespace) -> None:
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
 
     # GRPOConfig uses completion length naming for generation tokens.
     grpo_config = GRPOConfig(
@@ -543,16 +509,19 @@ def main(args: argparse.Namespace) -> None:
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
         max_completion_length=args.max_new_tokens,
-        max_steps=TOTAL_STEPS,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=0.5,
+        max_steps=args.max_steps,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
         report_to="wandb",
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
-        gradient_checkpointing=args.gradient_checkpointing,
-        gradient_checkpointing_kwargs=(
-            {"use_reentrant": False} if args.gradient_checkpointing else None
-        ),
+        model_init_kwargs={
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        },
         dataloader_num_workers=0,
         remove_unused_columns=False,        # keep gold_answer, options columns
         seed=42,
@@ -575,18 +544,19 @@ def main(args: argparse.Namespace) -> None:
 
     # Trainer
     trainer = GRPOTrainer(
-        model=model,
+        model=args.model,
         args=grpo_config,
         train_dataset=dataset,
         reward_funcs=[reward_fn],
         processing_class=tokenizer,
+        peft_config=peft_config,
         callbacks=callbacks,
     )
     print("Trainer created")
 
     print(f"Starting GRPO training: {args.model}")
     print(f"  group_size={args.group_size}, lr={LR}, kl_coef={KL_COEF}")
-    print(f"  max_new_tokens={args.max_new_tokens}, total_steps={TOTAL_STEPS}")
+    print(f"  max_new_tokens={args.max_new_tokens}, total_steps={args.max_steps}")
     print(f"  eval every {EVAL_STEPS} steps, save every {SAVE_STEPS} steps")
 
     print("Starting training...")
@@ -604,22 +574,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--run-name", default="grpo-base", help="WandB run name")
     parser.add_argument(
-        "--group-size",
-        type=int,
-        default=GROUP_SIZE,
-        help="Number of rollouts per prompt (reduce to 4 if OOM)",
-    )
-    parser.add_argument(
-        "--per-device-batch-size",
-        type=int,
-        default=1,
-        help="Prompts per device per step",
-    )
-    parser.add_argument(
         "--grad-accum",
         type=int,
         default=4,
         help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=GROUP_SIZE,
+        help="Number of completions to generate per prompt",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=TOTAL_STEPS,
+        help="Maximum number of GRPO training steps",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -631,16 +601,6 @@ if __name__ == "__main__":
         "--deepmath-only",
         action="store_true",
         help=f"Train using only DeepMath filtered data from {DEEPMATH_FILTERED_DATA_PATH}",
-    )
-    parser.add_argument(
-        "--no-quantize",
-        action="store_true",
-        help="Load the model directly in bfloat16 instead of 4-bit quantization",
-    )
-    parser.add_argument(
-        "--gradient-checkpointing",
-        action="store_true",
-        help="Enable gradient checkpointing to reduce VRAM at the cost of slower GRPO generation",
     )
     parser.add_argument(
         "--gdrive-remote",
