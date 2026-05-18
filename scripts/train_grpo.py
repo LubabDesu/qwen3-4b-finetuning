@@ -459,7 +459,7 @@ def main(args: argparse.Namespace) -> None:
             "kl_coef": KL_COEF,
             "group_size": args.group_size,
             "total_steps": TOTAL_STEPS,
-            "max_new_tokens": MAX_NEW_TOKENS,
+            "max_new_tokens": args.max_new_tokens,
         },
     )
 
@@ -505,7 +505,13 @@ def main(args: argparse.Namespace) -> None:
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=args.gradient_checkpointing,
+            gradient_checkpointing_kwargs=(
+                {"use_reentrant": False} if args.gradient_checkpointing else None
+            ),
+        )
 
     lora_config = LoraConfig(
         r=16,
@@ -536,13 +542,17 @@ def main(args: argparse.Namespace) -> None:
         num_generations=args.group_size,    # rollouts per prompt
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
-        max_completion_length=MAX_NEW_TOKENS,
+        max_completion_length=args.max_new_tokens,
         max_steps=TOTAL_STEPS,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
         report_to="wandb",
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
+        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs=(
+            {"use_reentrant": False} if args.gradient_checkpointing else None
+        ),
         dataloader_num_workers=0,
         remove_unused_columns=False,        # keep gold_answer, options columns
         seed=42,
@@ -576,7 +586,7 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"Starting GRPO training: {args.model}")
     print(f"  group_size={args.group_size}, lr={LR}, kl_coef={KL_COEF}")
-    print(f"  max_new_tokens={MAX_NEW_TOKENS}, total_steps={TOTAL_STEPS}")
+    print(f"  max_new_tokens={args.max_new_tokens}, total_steps={TOTAL_STEPS}")
     print(f"  eval every {EVAL_STEPS} steps, save every {SAVE_STEPS} steps")
 
     print("Starting training...")
@@ -612,6 +622,12 @@ if __name__ == "__main__":
         help="Gradient accumulation steps",
     )
     parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=MAX_NEW_TOKENS,
+        help="Maximum completion tokens generated per GRPO rollout",
+    )
+    parser.add_argument(
         "--deepmath-only",
         action="store_true",
         help=f"Train using only DeepMath filtered data from {DEEPMATH_FILTERED_DATA_PATH}",
@@ -620,6 +636,11 @@ if __name__ == "__main__":
         "--no-quantize",
         action="store_true",
         help="Load the model directly in bfloat16 instead of 4-bit quantization",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce VRAM at the cost of slower GRPO generation",
     )
     parser.add_argument(
         "--gdrive-remote",
