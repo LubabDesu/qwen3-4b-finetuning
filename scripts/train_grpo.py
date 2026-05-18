@@ -498,6 +498,16 @@ def main(args: argparse.Namespace) -> None:
         task_type="CAUSAL_LM",
     )
 
+    vllm_config_kwargs = {
+        "use_vllm": True,
+        "vllm_mode": "colocate",
+        "vllm_gpu_memory_utilization": args.vllm_gpu_mem,
+    }
+    if "vllm_max_model_length" in GRPOConfig.__dataclass_fields__:
+        vllm_config_kwargs["vllm_max_model_length"] = args.vllm_max_len
+    else:
+        vllm_config_kwargs["vllm_max_model_len"] = args.vllm_max_len
+
     # GRPOConfig uses completion length naming for generation tokens.
     grpo_config = GRPOConfig(
         output_dir=str(CHECKPOINT_DIR),
@@ -510,10 +520,7 @@ def main(args: argparse.Namespace) -> None:
         temperature=TEMPERATURE,
         beta=KL_COEF,                       # KL penalty coefficient
         max_completion_length=args.max_new_tokens,
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=args.vllm_gpu_mem,
-        vllm_max_model_length=args.vllm_max_len,
+        **vllm_config_kwargs,
         max_steps=args.max_steps,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
@@ -607,6 +614,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--vllm-max-len",
+        "--vllm-max-model-length",
+        "--vllm-max-model_length",
+        dest="vllm_max_len",
         type=int,
         default=16384,
         help="Maximum model context length for colocated vLLM",
