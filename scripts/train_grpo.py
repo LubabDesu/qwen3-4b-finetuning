@@ -50,13 +50,14 @@ CHECKPOINT_DIR = ROOT / "checkpoints" / "grpo"
 DRIVE_CHECKPOINT_DIR = Path("/content/drive/MyDrive/151B_SP26_Competition/checkpoints/grpo")
 EVAL_DATA_PATH = ROOT / "heldout_eval_set.jsonl"
 
-SYSTEM_PROMPTS = [
-    "You are a helpful assistant. Think step by step, then give your final answer inside \\boxed{}.",
-    "Solve the problem carefully. Show your reasoning, and put the final answer in \\boxed{}.",
-    "Work through the math step by step. Your final response must include the answer in \\boxed{}.",
-    "Reason clearly before answering. Finish with the final answer written inside \\boxed{}.",
-    "Analyze the problem and compute the answer. The final answer must be enclosed in \\boxed{}.",
-]
+SYSTEM_PROMPT = """You are an expert mathematician. Solve the problem step by step.
+
+Final answer rules:
+- Use exactly one final \\boxed{}.
+- For multi-part questions with multiple [ANS] blanks, put all answers comma-separated in that one box, in blank order.
+- Wrong: \\boxed{2}, \\boxed{4}, \\boxed{120}, \\boxed{-6}
+- Right: \\boxed{2, 4, 120, -6}
+- For MCQ, put only the option letter in \\boxed{}."""
 
 TOTAL_STEPS = 1000
 EVAL_STEPS = 50
@@ -80,9 +81,8 @@ _loose_judger = Judger(strict_extract=False)
 # ── Prompt formatting ────────────────────────────────────────────────────────
 
 def build_prompt(question: str) -> str:
-    system_prompt = random.choice(SYSTEM_PROMPTS)
     return (
-        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
