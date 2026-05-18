@@ -512,7 +512,8 @@ def main(args: argparse.Namespace) -> None:
         max_completion_length=args.max_new_tokens,
         use_vllm=True,
         vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.5,
+        vllm_gpu_memory_utilization=args.vllm_gpu_mem,
+        vllm_max_model_length=args.vllm_max_len,
         max_steps=args.max_steps,
         save_steps=SAVE_STEPS,
         logging_steps=EVAL_STEPS,
@@ -597,6 +598,18 @@ if __name__ == "__main__":
         type=int,
         default=MAX_NEW_TOKENS,
         help="Maximum completion tokens generated per GRPO rollout",
+    )
+    parser.add_argument(
+        "--vllm-gpu-mem",
+        type=float,
+        default=0.6,
+        help="GPU memory utilization target for colocated vLLM",
+    )
+    parser.add_argument(
+        "--vllm-max-len",
+        type=int,
+        default=16384,
+        help="Maximum model context length for colocated vLLM",
     )
     parser.add_argument(
         "--deepmath-only",
