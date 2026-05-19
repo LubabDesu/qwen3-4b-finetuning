@@ -74,11 +74,11 @@ KL_COEF = 0.01
 GROUP_SIZE = 8
 MAX_PROMPT_TOKENS = 2048
 MAX_NEW_TOKENS = 6144
-REWARD_MULTI_ANSWER_COUNT_BONUS = 0.03
-REWARD_MULTI_ANSWER_COUNT_PENALTY = 0.05
+REWARD_MULTI_ANSWER_COUNT_BONUS = 0.10
+REWARD_MULTI_ANSWER_COUNT_PENALTY = 0.15
 REWARD_MCQ_LETTER_BONUS = 0.03
 REWARD_MCQ_SHAPE_PENALTY = 0.05
-REWARD_FLOOR = -0.60
+REWARD_FLOOR = -0.50
 REWARD_CAP = 1.00
 REWARD_DIAGNOSTIC_EVERY = 200
 STOP_FLAT_STEPS = 200       # stop if reward/mean flat for this many consecutive steps
@@ -89,9 +89,13 @@ STOP_STD_MIN = 0.05         # diagnostic only; low reward/std should not stop GR
 _judger_local = threading.local()
 _judger_signal_lock = threading.Lock()
 _reward_stats: collections.Counter[str] = collections.Counter()
+_reward_window_stats: collections.Counter[str] = collections.Counter()
 _reward_total = 0
+_reward_window_total = 0
 _reward_sum = 0.0
-_reward_phase = "long"
+_reward_window_sum = 0.0
+_max_new_tokens = MAX_NEW_TOKENS
+_clip_penalty = 0.25
 
 
 # ── Prompt formatting ────────────────────────────────────────────────────────
@@ -183,6 +187,7 @@ def build_curriculum_dataset(
     problems: list[dict],
     total_steps: int,
     batch_size_per_step: int,
+    curriculum_ramp_steps: int | None = None,
 ) -> Dataset:
     """
     Pre-sample total_steps * batch_size_per_step problems using time-varying
@@ -194,8 +199,9 @@ def build_curriculum_dataset(
 
     rng = np.random.default_rng(seed=42)
     indices = []
+    ramp_steps = curriculum_ramp_steps or total_steps
     for step in range(total_steps):
-        t = step / max(total_steps - 1, 1)
+        t = min(step / max(ramp_steps - 1, 1), 1.0)
         weights = curriculum_weights(difficulties, t)
         batch_idx = rng.choice(n, size=batch_size_per_step, p=weights, replace=True)
         indices.extend(batch_idx.tolist())
@@ -221,6 +227,7 @@ def build_mixed_curriculum_dataset(
     public_warmup_steps: int,
     total_steps: int,
     batch_size_per_step: int,
+    curriculum_ramp_steps: int | None = None,
 ) -> Dataset:
     """
     Pre-sample training prompts. Public rows are used as a calibration stream;
@@ -230,7 +237,12 @@ def build_mixed_curriculum_dataset(
     warmup_public_mix_ratio = min(max(warmup_public_mix_ratio, 0.0), 1.0)
     public_warmup_steps = max(public_warmup_steps, 0)
     if not public_problems or (public_mix_ratio <= 0 and warmup_public_mix_ratio <= 0):
-        return build_curriculum_dataset(curriculum_problems, total_steps, batch_size_per_step)
+        return build_curriculum_dataset(
+            curriculum_problems,
+            total_steps,
+            batch_size_per_step,
+            curriculum_ramp_steps,
+        )
 
     difficulties = np.array([p["difficulty_level"] for p in curriculum_problems])
     n_curriculum = len(curriculum_problems)
@@ -250,8 +262,9 @@ def build_mixed_curriculum_dataset(
     public_count = 0
     curriculum_count = 0
     sample_pos = 0
+    ramp_steps = curriculum_ramp_steps or total_steps
     for step in range(total_steps):
-        t = step / max(total_steps - 1, 1)
+        t = min(step / max(ramp_steps - 1, 1), 1.0)
         weights = curriculum_weights(difficulties, t)
         for _ in range(batch_size_per_step):
             use_public = sample_pos in public_sample_positions
@@ -279,7 +292,8 @@ def build_mixed_curriculum_dataset(
         f"Mixed curriculum dataset sampled {public_count} public prompts and "
         f"{curriculum_count} curriculum prompts "
         f"(warmup_public_mix_ratio={warmup_public_mix_ratio}, "
-        f"public_warmup_steps={public_warmup_steps}, public_mix_ratio={public_mix_ratio})"
+        f"public_warmup_steps={public_warmup_steps}, public_mix_ratio={public_mix_ratio}, "
+        f"curriculum_ramp_steps={ramp_steps})"
     )
     return Dataset.from_list(rows)
 
@@ -401,7 +415,8 @@ def _analyze_completion(completion: str, gold: list[str], options: list[str]) ->
     fallback_box_missing_think = not has_think and has_usable_box
     prethink_box = has_think and not boxes_after and bool(boxes_before)
     correct = _judge_official(completion, gold, options)
-    contiguous_count = len(boxes_before) + len(boxes_after)
+    raw_usable_box_count = len(boxes_full)
+    scattered_box = has_usable_box and raw_box_count > raw_usable_box_count
     return {
         "completion": completion,
         "tokens": _approx_tokens(completion),
@@ -415,7 +430,7 @@ def _analyze_completion(completion: str, gold: list[str], options: list[str]) ->
         "ideal_box": ideal_box,
         "fallback_box_missing_think": fallback_box_missing_think,
         "prethink_box": prethink_box,
-        "is_scattered": has_usable_box and raw_box_count > max(contiguous_count, len(boxes_full), 1),
+        "is_scattered": scattered_box,
         "empty_or_unusable_box": raw_box_count > 0 and not has_usable_box,
         "boxes_before": boxes_before,
         "boxes_after": boxes_after,
@@ -431,47 +446,57 @@ def _analyze_completion(completion: str, gold: list[str], options: list[str]) ->
     }
 
 
-def _no_usable_box_reward(tokens: float) -> float:
-    if _reward_phase == "closure":
-        if tokens <= 1000:
-            return -0.15
-        if tokens <= 2000:
-            return -0.35
-        return REWARD_FLOOR
-    if tokens <= 1500:
-        return -0.15
-    if tokens <= 3000:
-        return -0.35
-    return REWARD_FLOOR
-
-
 def _base_reward(analysis: dict[str, Any]) -> tuple[float, list[str]]:
     correct = analysis["correct"]
-    tokens = analysis["tokens"]
+    ideal = analysis["ideal_box"]
+    scattered = analysis["is_scattered"]
+    has_usable = analysis["has_usable_box"]
+    empty_bad_box = analysis["has_box"] and not has_usable
+    clipped = analysis["tokens"] >= max(1, _max_new_tokens - 10)
+    tags = ["correct" if correct else "wrong"]
 
-    if analysis["is_scattered"]:
-        return (0.20 if correct else -0.20), ["scattered_box", "correct" if correct else "wrong"]
+    if ideal and empty_bad_box:
+        raise AssertionError("ideal_box and empty_bad_box cannot both be true")
 
-    if analysis["ideal_box"]:
-        return (1.00 if correct else 0.05), ["ideal_box", "correct" if correct else "wrong"]
+    if correct:
+        if ideal:
+            reward = 1.00
+            tags.append("ideal_box")
+        elif scattered:
+            reward = 0.70
+            tags.append("scattered_box")
+        elif has_usable:
+            reward = 0.50
+            tags.append("usable_bad_format")
+        else:
+            reward = 0.30
+            tags.append("no_usable_box")
+    else:
+        if ideal:
+            reward = 0.10
+            tags.append("ideal_box")
+        elif scattered:
+            reward = -0.30
+            tags.append("scattered_box")
+        elif has_usable:
+            reward = 0.00
+            tags.append("usable_bad_format")
+        else:
+            reward = -0.20
+            tags.append("no_usable_box")
 
     if analysis["fallback_box_missing_think"]:
-        return (0.70 if correct else 0.02), ["fallback_missing_think", "correct" if correct else "wrong"]
-
+        tags.append("fallback_missing_think")
     if analysis["prethink_box"]:
-        return (0.45 if correct else -0.05), ["prethink_box", "correct" if correct else "wrong"]
+        tags.append("prethink_box")
+    if empty_bad_box:
+        reward = min(reward, -0.30)
+        tags.append("empty_or_unusable_box")
+    if clipped:
+        reward -= _clip_penalty
+        tags.append("clipped")
 
-    if analysis["official_correct_no_usable_box"]:
-        if analysis["has_box"]:
-            return (0.20 if tokens <= 3000 else 0.05), ["correct_unusable_box"]
-        return (0.30 if tokens <= 3000 else 0.10), ["correct_no_box"]
-
-    if not analysis["has_usable_box"]:
-        if analysis["has_box"]:
-            return min(-0.30, _no_usable_box_reward(tokens)), ["empty_or_unusable_box"]
-        return _no_usable_box_reward(tokens), ["no_usable_box"]
-
-    return -0.10, ["malformed_box"]
+    return reward, tags
 
 
 def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float, list[str]]:
@@ -479,7 +504,7 @@ def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float,
     tags = []
     answer_text = str(analysis["answer_text"]).strip()
 
-    if analysis["is_multi_answer"]:
+    if analysis["is_multi_answer"] and analysis["has_usable_box"]:
         pred_parts = _split_top_level_commas(answer_text)
         if len(pred_parts) == len(gold):
             adjustment += REWARD_MULTI_ANSWER_COUNT_BONUS
@@ -499,79 +524,92 @@ def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float,
     return adjustment, tags
 
 
-def _batch_relative_length_penalty(analysis: dict[str, Any], group: list[dict[str, Any]]) -> float:
-    if analysis["correct"] and analysis["ideal_box"]:
-        return 0.0
-
-    if not analysis["has_box"] and not analysis["official_correct_no_usable_box"]:
-        return 0.0
-
-    correct_lengths = [
-        item["tokens"]
-        for item in group
-        if item["correct"] and item["has_usable_box"]
-    ]
-
-    if correct_lengths:
-        if _reward_phase == "closure":
-            allowance = max(1000.0, 1.15 * (sum(correct_lengths) / len(correct_lengths)))
-        else:
-            allowance = max(1500.0, 1.25 * (sum(correct_lengths) / len(correct_lengths)))
-    elif _reward_phase == "closure":
-        allowance = 2500.0 if analysis["correct"] else 1800.0
-    else:
-        allowance = 5000.0 if analysis["correct"] else 3000.0
-
-    if analysis["tokens"] <= allowance:
-        return 0.0
-
-    excess_ratio = (analysis["tokens"] - allowance) / allowance
-    if analysis["correct"]:
-        return min(0.10 if _reward_phase == "closure" else 0.15, 0.08 * excess_ratio)
-    return min(0.35 if _reward_phase == "closure" else 0.40, (0.25 if _reward_phase == "closure" else 0.20) * excess_ratio)
-
-
 def _record_reward_stats(tags: list[str], reward: float) -> None:
-    global _reward_total, _reward_sum
+    global _reward_total, _reward_window_total, _reward_sum, _reward_window_sum
     _reward_total += 1
+    _reward_window_total += 1
     _reward_sum += reward
+    _reward_window_sum += reward
     _reward_stats.update(tags)
+    _reward_window_stats.update(tags)
     if _reward_total % REWARD_DIAGNOSTIC_EVERY != 0:
         return
 
     avg_reward = _reward_sum / max(_reward_total, 1)
+    window_avg_reward = _reward_window_sum / max(_reward_window_total, 1)
     key_order = [
         "correct",
         "wrong",
         "ideal_box",
+        "usable_bad_format",
         "fallback_missing_think",
         "prethink_box",
-        "correct_no_box",
-        "correct_unusable_box",
         "no_usable_box",
         "empty_or_unusable_box",
-        "malformed_box",
         "scattered_box",
+        "clipped",
         "multi_count_match",
         "multi_count_mismatch",
         "mcq_letter",
         "mcq_bad_shape",
-        "length_penalized",
     ]
     counts = " ".join(f"{key}={_reward_stats[key]}" for key in key_order if _reward_stats[key])
     print(f"[reward] n={_reward_total} avg={avg_reward:.4f} {counts}", flush=True)
+
+    window_metrics = {
+        "reward_debug/window_mean": window_avg_reward,
+    }
+    for key in key_order:
+        window_metrics[f"reward_debug/{key}_rate"] = (
+            _reward_window_stats[key] / max(_reward_window_total, 1)
+        )
+    for prefix in ["mcq", "multi", "single"]:
+        type_count = _reward_window_stats[f"{prefix}_count"]
+        window_metrics[f"reward_debug/{prefix}_count"] = type_count
+        window_metrics[f"reward_debug/{prefix}_correct_rate"] = (
+            _reward_window_stats[f"{prefix}_correct"] / max(type_count, 1)
+        )
+        window_metrics[f"reward_debug/{prefix}_ideal_box_rate"] = (
+            _reward_window_stats[f"{prefix}_ideal_box"] / max(type_count, 1)
+        )
+        window_metrics[f"reward_debug/{prefix}_clipped_rate"] = (
+            _reward_window_stats[f"{prefix}_clipped"] / max(type_count, 1)
+        )
+    try:
+        wandb.log(window_metrics)
+    except Exception as exc:
+        print(f"[reward] wandb log warning: {exc}", flush=True)
+
+    _reward_window_stats.clear()
+    _reward_window_total = 0
+    _reward_window_sum = 0.0
+
+
+def _type_tags(analysis: dict[str, Any]) -> list[str]:
+    if analysis["is_mcq"]:
+        prefix = "mcq"
+    elif analysis["is_multi_answer"]:
+        prefix = "multi"
+    else:
+        prefix = "single"
+
+    tags = [f"{prefix}_count"]
+    if analysis["correct"]:
+        tags.append(f"{prefix}_correct")
+    if analysis["ideal_box"]:
+        tags.append(f"{prefix}_ideal_box")
+    if analysis["tokens"] >= max(1, _max_new_tokens - 10):
+        tags.append(f"{prefix}_clipped")
+    return tags
 
 
 def compute_reward(analysis: dict[str, Any], group: list[dict[str, Any]], gold: list[str]) -> float:
     reward, tags = _base_reward(analysis)
     adjustment, shape_tags = _shape_adjustment(analysis, gold)
-    length_penalty = _batch_relative_length_penalty(analysis, group)
-    if length_penalty:
-        tags.append("length_penalized")
 
-    reward = reward + adjustment - length_penalty
+    reward = reward + adjustment
     reward = min(REWARD_CAP, max(REWARD_FLOOR, float(reward)))
-    _record_reward_stats(tags + shape_tags, reward)
+    _record_reward_stats(tags + shape_tags + _type_tags(analysis), reward)
     return reward
 
 
@@ -735,8 +773,9 @@ class RcloneBackupCallback(TrainerCallback):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(args: argparse.Namespace) -> None:
-    global _reward_phase
-    _reward_phase = args.reward_phase
+    global _max_new_tokens, _clip_penalty
+    _max_new_tokens = args.max_new_tokens
+    _clip_penalty = args.clip_penalty
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     # WandB init
@@ -752,10 +791,11 @@ def main(args: argparse.Namespace) -> None:
             "total_steps": args.max_steps,
             "max_new_tokens": args.max_new_tokens,
             "public_mix_ratio": args.public_mix_ratio,
-            "reward_phase": args.reward_phase,
             "min_difficulty_level": args.min_difficulty_level,
             "public_warmup_steps": args.public_warmup_steps,
             "warmup_public_mix_ratio": args.warmup_public_mix_ratio,
+            "curriculum_ramp_steps": args.curriculum_ramp_steps,
+            "clip_penalty": args.clip_penalty,
         },
     )
 
@@ -771,8 +811,6 @@ def main(args: argparse.Namespace) -> None:
         problems.extend(inference_partial)
         print(f"Loaded {len(problems)} total problems after adding partial inference rows")
     effective_min_difficulty = args.min_difficulty_level
-    if effective_min_difficulty is None and args.reward_phase == "closure":
-        effective_min_difficulty = 4
     problems = filter_by_min_difficulty(problems, effective_min_difficulty)
     public_problems = load_public_grpo_train(args.public_train_path)
 
@@ -786,6 +824,7 @@ def main(args: argparse.Namespace) -> None:
         args.public_warmup_steps,
         args.max_steps,
         batch_per_step,
+        args.curriculum_ramp_steps,
     )
     print("Dataset built")
     print(f"Built curriculum dataset: {len(dataset)} rows")
@@ -911,18 +950,24 @@ if __name__ == "__main__":
         help="Maximum completion tokens generated per GRPO rollout",
     )
     parser.add_argument(
+        "--curriculum-ramp-steps",
+        type=int,
+        default=None,
+        help=(
+            "Steps used to ramp curriculum from easy to hard. Defaults to "
+            "--max-steps, preserving the original full-run linear ramp."
+        ),
+    )
+    parser.add_argument(
+        "--clip-penalty",
+        type=float,
+        default=0.25,
+        help="Flat reward penalty when completion reaches max_new_tokens.",
+    )
+    parser.add_argument(
         "--resume-from-checkpoint",
         default="",
         help="Trainer checkpoint directory to resume from, e.g. checkpoints/grpo/checkpoint-300.",
-    )
-    parser.add_argument(
-        "--reward-phase",
-        choices=["closure", "long"],
-        default="long",
-        help=(
-            "Reward length shaping mode. closure is stricter and defaults to "
-            "difficulty_level >= 4; long is looser for hard reasoning."
-        ),
     )
     parser.add_argument(
         "--min-difficulty-level",
@@ -930,8 +975,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Keep only curriculum rows with difficulty_level >= this value. "
-            "Levels are inverted: 5 is easiest, 1 is hardest. Defaults to 4 "
-            "for --reward-phase closure and no filter for long."
+            "Levels are inverted: 5 is easiest, 1 is hardest."
         ),
     )
     parser.add_argument(
