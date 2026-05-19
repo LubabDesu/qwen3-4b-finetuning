@@ -89,7 +89,7 @@ REWARD_DIAGNOSTIC_EVERY = 200
 STOP_FLAT_STEPS = 200       # stop if reward/mean flat for this many consecutive steps
 STOP_KL_MAX = 10.0          # stop if kl_divergence exceeds this
 STOP_LENGTH_MAX = 7000      # stop if mean response length exceeds this (tokens)
-STOP_STD_MIN = 0.05         # stop if reward/std drops below this
+STOP_STD_MIN = 0.05         # diagnostic only; low reward/std should not stop GRPO
 
 _strict_judger = Judger(strict_extract=True)
 _reward_stats: collections.Counter[str] = collections.Counter()
@@ -538,7 +538,7 @@ class StopConditionCallback(TrainerCallback):
     - reward/mean flat for STOP_FLAT_STEPS consecutive steps
     - kl_divergence > STOP_KL_MAX
     - mean response length > STOP_LENGTH_MAX tokens
-    - reward/std < STOP_STD_MIN
+    - reward/std < STOP_STD_MIN is logged but does not stop training
     """
 
     def __init__(self, eval_steps: int) -> None:
@@ -578,7 +578,10 @@ class StopConditionCallback(TrainerCallback):
                     reason = f"reward/mean flat ~{STOP_FLAT_STEPS} steps (span={span:.4f})"
 
         if reward_std is not None and reward_std < STOP_STD_MIN:
-            reason = f"reward/std={reward_std:.4f} < {STOP_STD_MIN}"
+            print(
+                f"\n[StopCondition] reward/std={reward_std:.4f} < {STOP_STD_MIN}; "
+                "continuing"
+            )
 
         if kl is not None and kl > STOP_KL_MAX:
             reason = f"kl={kl:.2f} > {STOP_KL_MAX}"
@@ -770,7 +773,7 @@ def main(args: argparse.Namespace) -> None:
     print(f"  log every {LOGGING_STEPS} steps, save every {SAVE_STEPS} steps")
 
     print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     wandb.finish()
     print("Training complete.")
 
@@ -806,6 +809,11 @@ if __name__ == "__main__":
         type=int,
         default=MAX_NEW_TOKENS,
         help="Maximum completion tokens generated per GRPO rollout",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default="",
+        help="Trainer checkpoint directory to resume from, e.g. checkpoints/grpo/checkpoint-300.",
     )
     parser.add_argument(
         "--vllm-gpu-mem",
