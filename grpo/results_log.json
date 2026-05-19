@@ -1,0 +1,15 @@
+[
+  {
+    "stage": "grpo_public_ckpt_100",
+    "n": 300,
+    "accuracy": 0.5833333333333334,
+    "correct": 175,
+    "mcq_accuracy": 0.6283185840707964,
+    "mcq_total": 113,
+    "multi_answer_accuracy": 0.494949494949495,
+    "multi_answer_total": 99,
+    "avg_response_words": 2400.8533333333335,
+    "boxed_compliance_rate": 0.5233333333333333,
+    "inference_backend": "vllm"
+  }
+]

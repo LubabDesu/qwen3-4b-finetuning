@@ -1,0 +1,137 @@
+[
+  {
+    "id": 501,
+    "question": "For the equation $y=6.5x-6$, a. the $y$-intercept is [ANS], and the slope is [ANS]. b. the line [ANS] A. slopes upward  B. is horizontal  C. slopes downward  D. none of the above\nc. use two points to graph the equation.",
+    "gold_answer": [
+      "-6",
+      "6.5",
+      "A"
+    ],
+    "model_response_preview": "Okay, let's tackle this math problem step by step. The question has three parts: finding the y-intercept and slope for part (a), determining whether the line slopes upward or not for part (b), and using two points to graph the equation for part (c). Let me start with each part individually.\n\nStarting with part (a): For the equation \\( y = 6.5x - 6 \\), we need to find the y-intercept and the slope. I remember that linear equations can be written in the form \\( y = mx + b \\), where m represents the slope and b is the y-intercept. Comparing this standard form to the given equation, it looks like they've already provided both values directly. \n\nSo here, the coefficient of x is 6.5, which should be the slope (m). Then, the constant term (-6) must be the y-intercept (b). Therefore, the y-intercept is at point (0, -6) because when x is zero, y equals -6. That makes sense. So my answers for part (a) would be:\n\nThe y-intercept is **-6**, and the slope is **6.5**.\n\nMoving on to part (b): We have...",
+    "word_count": 906,
+    "format_ok": false
+  },
+  {
+    "id": 285,
+    "question": "1) Sadee has 196 quarters. She wants to put them in paper rolls. Each roll holds 20 quarters. a) The number of rolls that will be completely filled is [ANS]. b) The number of quarters in the unfilled roll is [ANS]. 2) Bukka has 1376 paperback books. He wants to put his paperback books on storage shelves. Each shelf can hold 50 paperback books. a) The number of shelves that will be completely filled is [ANS]. b) The number of paperback books that will be on the shelf that is not completely filled is [ANS].",
+    "gold_answer": [
+      "9",
+      "16",
+      "27",
+      "26"
+    ],
+    "model_response_preview": "Okay, let's tackle these two problems one by one. Starting with question 1 about Sadee and her quarters. \n\nSo, part (a): Sadee has 196 quarters and each roll holds 20 quarters. We need to find out how many rolls will be completely filled. Hmm, this sounds like division. If we divide the total number of quarters by the capacity per roll, right? So 196 divided by 20. Let me do that calculation. \n\nFirst, 20 times 9 is 180 because 20*10=200 minus 20 is 180. Then subtracting 180 from 196 gives us 16 left over. Wait, so does that mean there are 9 complete rolls? Because after filling 9 rolls, which would take up 180 quarters, she still has 16 remaining. Yeah, that makes sense. But wait, maybe I should check again. Maybe using long division?\n\nLet me write it down:\n\nHow many times does 20 go into 196?\n- 20 goes into 19 zero times. \n- Bring down the next digit, making it 196.\nWait, no, actually when dividing 196 by 20:\nStarts at hundreds place: 1 hundred divided by 2 tens... Well, perhaps bette...",
+    "word_count": 619,
+    "format_ok": false
+  },
+  {
+    "id": 178,
+    "question": "Suppose the next time you buy a house including the land it sits on for 165000 Dollars. The real estate agent tells you that the land costs 17000 more than the house. You apply your formula derived in the previous problem. To do so you set $S=$ [ANS] dollars and $D=$ [ANS] dollars. and you find out that the price of the house is [ANS] dollars and the price of the land is [ANS] dollars.",
+    "gold_answer": [
+      "165000",
+      "17000",
+      "74000",
+      "91000"
+    ],
+    "model_response_preview": "Okay, let's see here. I need to figure out how much the house and the land cost based on the information given. So, the total purchase price is $165,000. The real estate agent says the land costs $17,000 more than the house. Hmm, right? \n\nFirst off, if we're dealing with two things\u2014the house (let me call its value H) and the land (which would be L)\u2014and their combined cost is $165k, then mathematically that should translate into:\n\nH + L = 165,000\n\nBut wait, there's another piece of info: \"the land costs 17,000 more than the house.\" That means L = H + 17,000. Right?\n\nSo now we have two equations:\n1. H + L = 165,000\n2. L = H + 17,000\n\nI think substitution method might work here. Let me substitute equation 2 into equation 1. If L equals H plus 17k, then replacing L in the first equation gives:\n\nH + (H + 17,000) = 165,000\n\nCombine like terms:\n\n2H + 17,000 = 165,000\n\nNow subtract 17,000 from both sides:\n\n2H = 165,000 - 17,000\n2H = 148,000\n\nThen divide both sides by 2:\n\nH = 148,000 / 2\nH = 74...",
+    "word_count": 737,
+    "format_ok": false
+  },
+  {
+    "id": 451,
+    "question": "Insert 5 arithmetic means between 58 and 42. First mean=[ANS]\nSecond mean=[ANS]\nThird mean=[ANS]\nFourth mean=[ANS]\nFifth mean=[ANS]\nNote: Your answers must be in decimal form, given to at least 5 places.",
+    "gold_answer": [
+      "55.3333333333333",
+      "52.6666666666667",
+      "50",
+      "47.3333333333333",
+      "44.6666666666667"
+    ],
+    "model_response_preview": "Okay, so I need to insert five arithmetic means between 58 and 42. Hmm, let me recall what that means. If we have two numbers and want to find several terms such that they form a sequence where each term is equally spaced from its neighbors, those middle terms are called arithmetic means. Right?\n\nFirst off, when inserting n arithmetic means between two numbers, say A and B, there will be (n+1) total terms including both endpoints. In this case, since we're adding 5 means, the entire sequence should consist of 6 terms starting from 58 up to 42. So, positions would be:\n\nTerm 0: 58\n\nTerms 1-5: The five arithmetic means we need to find\n\nTerm 6: 42\n\nWait, actually, maybe it's better to think of them as Term 1 being 58, then Terms 2 through 7? Wait no, hold on. Let me clarify.\n\nIf we start counting from the first number as position 1, then inserting k means would result in k + 2 terms. But sometimes people count differently depending on context. Maybe here, since the question says \"insert 5 ...",
+    "word_count": 1505,
+    "format_ok": true
+  },
+  {
+    "id": 326,
+    "question": "For each of the following, select the most appropriate unit of measurement:\nThe thickness of an eyeglass lens uses [ANS] The height of an old oak tree uses [ANS] The distance you drive on a summer vacation uses [ANS] How far LeBron James shoots a free throw uses [ANS] How far it is to the sun uses [ANS] The length of fruit rollups uses [ANS]",
+    "gold_answer": [
+      "millimeters",
+      "meters",
+      "kilometers",
+      "meters",
+      "kilometers",
+      "centimeters"
+    ],
+    "model_response_preview": "Okay, let's tackle this question about selecting the right units for different measurements. Hmm, I need to figure out which unit fits best for each scenario. Let me start by recalling common metric units like meters, centimeters, kilometers, etc., as well as imperial ones like feet or miles. But since the problem doesn't specify whether they want metric or imperial, maybe just go with standard SI units? Wait, but sometimes people use inches instead of cm. Maybe better to think generally first.\n\nFirst item: \"The thickness of an eyeglass lens.\" Eyeglasses lenses... how thick do those usually get? If I've ever looked at them, they're pretty thin. Like, maybe millimeters? Because if something was measured in centimeters that would be way too big\u2014like 10mm vs 1cm. So probably millimeters (mm) here. Yeah, because even a small lens might have some thickness around 2-3 mm. Centimeter would be more than enough space between two fingers, so definitely not cm. Meters would be ridiculous. Kilomet...",
+    "word_count": 1321,
+    "format_ok": false
+  },
+  {
+    "id": 778,
+    "question": "An outbreak of the deadly Ebola virus in 2002 and 2003 killed 91 of the 95 gorillas in 7 home ranges in the Congo. To study the spread of the virus, measure \" distance\" by the number of home ranges separating a group of gorillas from the first group infected. Here are data on distance and number of days until deaths began in each later group:\n$\\begin{array}{ccccccc}\\hline Distance x & 4 & 4 & 6 & 6 & 4 & 6 \\\\ \\hline Days y & 4 & 21 & 31 & 40 & 45 & 46 \\\\ \\hline \\end{array}$ Use a calculator or software to find the following values.\n(a) Find the mean and standard deviation of $x$. MEAN: [ANS]\nSTANDARD DEVIATION: [ANS]\n(b) Find the mean and standard deviation of $y$. MEAN: [ANS]\nSTANDARD DEVIATION: [ANS]\n(c) Find the correlation $r$ between $x$ and $y$. r: [ANS]",
+    "gold_answer": [
+      "5",
+      "1.09545",
+      "31.1667",
+      "16.3146",
+      "0.525969"
+    ],
+    "model_response_preview": "Okay, let's tackle this problem step by step. So we have two variables here: distance (x) which is measured as the number of home ranges separating groups from the first infected group, and days (y), which is how many days it took for death symptoms to start in those groups after infection. We need to calculate some statistics based on these data points provided.\n\nFirst part (a): Finding the mean and standard deviation of x. The distances given are 4, 4, 6, 6, 4, 6. Let me list them out again to make sure I count correctly:\n\nDistance x: 4, 4, 6, 6, 4, 6. That's six observations total. \n\nTo compute the mean, I remember that the formula is summing up all the numbers and dividing by the count. So adding them together: 4 + 4 = 8; then add another 6: 8 + 6 = 14; next 6: 14 + 6 = 20; then 4: 20 + 4 = 24; lastly 6: 24 + 6 = 30. Wait, hold on, wait. Wait, no\u2014wait, there are three 4s? Let me check again. Original data says four times 4? No, looking back at the table:\n\nWait, the original data ha...",
+    "word_count": 3472,
+    "format_ok": false
+  },
+  {
+    "id": 198,
+    "question": "The length $m$, in inches, of a model train is directly proportional to the length $r$, in inches, of the corresponding real train.\n(a) Write an equation that expresses $m$ as a function of $r$, using $k$ for the constant of proportionality. [ANS]\n(b) A Z scale model train is 1/220th the size of a real train. What is the constant of proportionality? [ANS]\nWhat is the length, in feet, of a real locomotive if its Z scale model is $10$ inches long? [ANS] feet.\n(c) A G scale model train is 1/24th the size of a real train. What is the constant of proportionality? [ANS]\nWhat is the length, in inches, of a G scale model if its real locomotive is $75$ feet long? [ANS] inches.",
+    "gold_answer": [
+      "m = k*r",
+      "0.00454545",
+      "183.333",
+      "0.0416667",
+      "37.5"
+    ],
+    "model_response_preview": "Okay, let's tackle this problem part by part. First off, I need to remember what direct proportion means. If two quantities are directly proportional, their ratio remains constant. So, m (model length) divided by r (real length) should equal some constant k. That makes sense because when they say \"directly proportional,\" it implies m = kr or something like that. Let me write down the first question:\n\n**(a)** The problem says we need to express m as a function of r using k as the constant of proportionality. Since they're directly proportional, the relationship must be linear through the origin. So yeah, m equals k times r. Simple enough. So my equation would be m(r) = k * r. Wait, but maybe they want it written differently? Like solving for m... Hmm, no, just expressing m as a function of r. Yeah, so m = k*r. That seems right.\n\nMoving on to **(b)** which talks about a Z-scale model being 1/220th the size of a real train. They ask for the constant of proportionality here. Well, since th...",
+    "word_count": 926,
+    "format_ok": false
+  },
+  {
+    "id": 940,
+    "question": "The questions involves the data set for Richmond townhouses obtained on 2014.11.03. For your subset, the response variable is: asking price divided by 10000: askpr=c(41.99, 77.8, 46.8, 54.8, 49.9, 51.68, 50.5, 65.8, 40.9, 60.8, 40.8, 50.8, 79.8, 40.8, 33.7, 57.8, 47.8, 86.8, 56.8, 50.8, 65.99, 47.9, 54.98, 68.5, 26.99, 55.2, 48.8, 53.9, 52.4, 57.8, 74.8, 45.99, 78.8, 58.39, 71.99, 62.9, 53.8, 58.8, 73.8, 108.8, 73.9, 55.8, 61.5, 62.8888, 54.8, 25.9, 59.8, 51.99, 68.5, 44.8) The explanatory variables are: (i) finished floor area divided by 100 ffarea=c(12.9, 16.5, 16.2, 15.46, 15.6, 15.1, 12.26, 13.45, 16.06, 13.2, 14, 16.6, 15.25, 12.26, 12, 12.01, 13.34, 15.08, 15.5, 12.27, 22.78, 12.1, 13.06, 13.59, 10.5, 15.3, 14.8, 11.84, 16.22, 13.84, 17.48, 16.01, 19.48, 15.09, 15.05, 14, 10.95, 17.37, 17.54, 23.98, 15.15, 13.06, 14.5, 15.77, 11.26, 6.1, 17.63, 12.09, 15.76, 9.4) (ii) age=c(44, 3, 30, 41, 20, 20, 3, 1, 25, 3, 38, 23, 3, 29, 28, 0, 32, 1, 23, 17, 35, 7, 1, 2, 37, 9, 50, 15, 25, 10, 5, 25, 11, 8, 8, 5, 18, 26, 9, 16, 0, 0, 7, 6, 0, 11, 26, 7, 4, 14) (iii) monthly maintenance fee divided by 10 mfee=c(23.2, 25.4, 16, 31, 27, 24.5, 18, 18.2, 24.4, 18.9, 23, 19.9, 35, 19.8, 25.9, 14.2, 24.5, 48.8, 17.4, 25.2, 57.4, 18, 19.6, 17, 28, 16.9, 25, 21, 36.4, 16, 29.7, 33.7, 20.4, 20.3, 22.3, 19.6, 24.7, 31, 18.2, 36.9, 22.2, 18.6, 18.7, 35.7, 24.8, 17.1, 32, 18.1, 22.1, 23.3) (iv) number of bedrooms beds=c(3, 4, 4, 3, 3, 3, 3, 3, 2, 3, 3, 4, 2, 3, 2, 3, 3, 3, 3, 2, 2, 3, 3, 3, 2, 3, 3, 2, 3, 3, 4, 3, 3, 4, 3, 3, 2, 3, 4, 3, 4, 3, 3, 3, 2, 1, 5, 3, 4, 2) After you have copied the above R vectors into your R session, you can get a dataframe with richmondtownh=data.frame(askpr,ffarea,age,mfee,beds)\nThe corresponding vectors for the holdout set are: askpr.ho=c(57.5, 53.8, 68.8, 58.68, 79.99, 56.88, 48.5, 68.8, 81.9) ffarea.ho=c(13.46, 12.22, 15.95, 13.96, 22, 15.78, 14.8, 16.9, 20.95) age.ho=c(10, 9, 18, 9, 20, 17, 24, 8, 19) mfee.ho=c(22.1, 18.5, 23.6, 22, 26.7, 17.3, 16.1, 19.4, 34.8) beds.ho=c(3, 3, 3, 3, 3, 4, 3, 4, 1)\nCreate a second data frame: holdout=data.frame(askpr.ho,ffarea.ho,age.ho,mfee.ho,beds.ho) names(holdout)=names(richmondtownh) [to make variables names the same as before]\nUse the ls.cvrmse() function from the course web site with 3 and 4 explanatory variables, when askpr is the response variable. For 4 explanatory variables, all of the above are included. For 3 explanatory variables, all of the above are included except beds.\nPlease use 3 decimal places for the answers below which are not integer-valued\nPart a) The values of residual SD or residual SE for the regressions with 3 and 4 explanatory variables are respectively: 3 explanatory: [ANS]\n4 explanatory: [ANS]\nPart b) The values of the leave-one-out cross-validation RMS prediction error for the regressions with 3 and 4 explanatory variables are respectively: 3 explanatory: [ANS]\n4 explanatory: [ANS]\nPart c) The values of the holdout RMS prediction error for the regressions with 3 and 4 explanatory variables are respectively: 3 explanatory: [ANS]\n4 explanatory: [ANS]\nPart d) Do you get the same conclusion on which is better between the 3-explanatory versus 4-explanatory models from the summaries in (a), (b), (c). [ANS] (enter either Yes or No).\nPart e) Compare the three values for the models with 3 explanatory variables (respectively 4 explanatory); that is, values of residual SE, leave-one out root mean square error and holdout subset root mean square error for 3 explanatory (respectively, 4 explanatory). What is the best explanation for the root mean square prediction errors to be larger for parts (b) and (c)? [ANS] A. out-of-sample variability is always larger  B. sampling variability  C. sample size is small  D. the RMS prediction error values were not always larger for my data set  E. the linear approximation to a non-linear function of the explanatory variables",
+    "gold_answer": [
+      "7.31285",
+      "7.38789",
+      "8.2397",
+      "8.64226",
+      "3.19839",
+      "3.39998",
+      "Yes",
+      "D"
+    ],
+    "model_response_preview": "Okay, let's tackle this problem step by step. I need to figure out the residuals standard deviation (SE) and the various RMSE measures for both 3-variable and 4-variable regression models using the given datasets. Then compare them based on those results. Let me start by recalling what each term means.\n\nFirst, **residual SE** refers to the standard deviation of the residuals after fitting the model. It gives us an idea of how much variation there is around the fitted line. Lower SE usually indicates a better fit.\n\nNext, **leave-one-out CV RMSPE** uses k-fold cross-validation where we remove one observation at a time, train the model on the remaining ones, predict the removed point, compute the squared difference, average it over all points, then take the square root. This helps estimate generalization performance without needing separate validation sets.\n\nThen, **holdout RMSPE** takes a predefined test set (the 'ho' dataset here) and computes the RMSE directly on these unseen samples. ...",
+    "word_count": 1326,
+    "format_ok": false
+  },
+  {
+    "id": 775,
+    "question": "Among drivers who have had a car crash in the last year, 250 were randomly selected and categorized by age, with the results listed in the table below. $\\begin{array}{ccccc}\\hline Age & Under 25 & 25-44 & 45-64 & Over 64 \\\\ \\hline Drivers & 101 & 61 & 35 & 53 \\\\ \\hline \\end{array}$ If all ages have the same crash rate, we would expect (because of the age distribution of licensed drivers) the given categories to have 16\\%, 44\\%, 27\\%, 13\\% of the subjects, respectively. At the 0.025 significance level, test the claim that the distribution of crashes conforms to the distribution of ages. The test statistic is $\\chi^2=$ [ANS]\nThe critical value is $\\chi^2=$ [ANS]\nThe conclusion is [ANS] A. There is not sufficient evidence to warrant the rejection of the claim that the distribution of crashes conforms to the distibuion of ages.  B. There is sufficient evidence to warrant the rejection of the claim that the distribution of crashes conforms to the distibuion of ages.",
+    "gold_answer": [
+      "143.43119010619",
+      "9.34840",
+      "B"
+    ],
+    "model_response_preview": "Okay, let's tackle this chi-square goodness-of-fit test problem. Hmm, so first, I need to remember what exactly a chi-square test for independence or homogeneity does here. Wait, no, actually, since they're comparing observed frequencies against expected ones based on some theoretical distribution, it should be a goodness-of-fit test. Right?\n\nAlright, the question says that among drivers who've had a crash in the past year, there are different age groups. They want us to check if these distributions match up with the general population's age distribution. So, basically, do people crashing cars at rates proportional to their actual age group? Or maybe more likely, like older drivers might crash less but still get into accidents because they drive longer hours? Not sure, but regardless, the data provided gives the observed counts per age category versus the expected percentages from the overall driver population.\n\nFirst, let me note down the given information:\n\nObserved counts:\nUnder 25:...",
+    "word_count": 1574,
+    "format_ok": false
+  },
+  {
+    "id": 161,
+    "question": "The probability that a \\$1 ticket DOES NOT win in the State Lottery is $\\frac{7258072}{7258073}$. The probabilty $p$ that $n$ independently sold tickets are ALL losers and the jackpot rolls over is given by $p=(\\frac{7258072}{7258073})^n$. As $n$ increases, is $p$ increasing or decreasing? In other words, as the number of tickets sold increases, is the probability of a rollover increasing or decreasing? [ANS]\nFor what number of tickets sold is the probability of a rollover greater than 55\\%? Fewer than [ANS] tickets must be sold.",
+    "gold_answer": [
+      "DECREASING",
+      "4339144.29375749"
+    ],
+    "model_response_preview": "Okay, let's tackle this lottery problem. So first part says we need to figure out whether the probability p decreases or increases as n (the number of tickets) gets larger. Then second part wants us to find how many tickets would make the probability exceed 55%. Hmm, okay.\n\nStarting with the first question: Is p increasing or decreasing when n goes up?\n\nGiven that each individual ticket has a probability of losing equal to 7258072/7258073. Since they're independent events, multiplying these probabilities together for n tickets gives p = (7258072/7258073)^n. \n\nNow, thinking about exponential functions... If I have something like f(n) = r^n where |r| < 1, then as n increases, f(n) approaches zero because any fraction less than 1 raised to higher powers becomes smaller. For example, if it was \u00bd^n, then at n=1 it's \u00bd, n=2 it's\u00bc, etc., getting closer to zero. Similarly here, since 7258072 divided by 7258073 is just slightly less than 1\u2014like almost certain loss per ticket\u2014the more tickets th...",
+    "word_count": 1860,
+    "format_ok": false
+  }
+]
