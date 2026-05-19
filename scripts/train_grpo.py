@@ -467,6 +467,8 @@ def _base_reward(analysis: dict[str, Any]) -> tuple[float, list[str]]:
         return (0.30 if tokens <= 3000 else 0.10), ["correct_no_box"]
 
     if not analysis["has_usable_box"]:
+        if analysis["has_box"]:
+            return min(-0.30, _no_usable_box_reward(tokens)), ["empty_or_unusable_box"]
         return _no_usable_box_reward(tokens), ["no_usable_box"]
 
     return -0.10, ["malformed_box"]
@@ -547,6 +549,7 @@ def _record_reward_stats(tags: list[str], reward: float) -> None:
         "correct_no_box",
         "correct_unusable_box",
         "no_usable_box",
+        "empty_or_unusable_box",
         "malformed_box",
         "scattered_box",
         "multi_count_match",
