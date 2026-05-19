@@ -96,6 +96,7 @@ _reward_sum = 0.0
 _reward_window_sum = 0.0
 _max_new_tokens = MAX_NEW_TOKENS
 _clip_penalty = 0.25
+_reward_stats_lock = threading.Lock()
 
 
 # ── Prompt formatting ────────────────────────────────────────────────────────
@@ -526,18 +527,27 @@ def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float,
 
 def _record_reward_stats(tags: list[str], reward: float) -> None:
     global _reward_total, _reward_window_total, _reward_sum, _reward_window_sum
-    _reward_total += 1
-    _reward_window_total += 1
-    _reward_sum += reward
-    _reward_window_sum += reward
-    _reward_stats.update(tags)
-    _reward_window_stats.update(tags)
-    if _reward_total % REWARD_DIAGNOSTIC_EVERY != 0:
-        return
+    with _reward_stats_lock:
+        _reward_total += 1
+        _reward_window_total += 1
+        _reward_sum += reward
+        _reward_window_sum += reward
+        _reward_stats.update(tags)
+        _reward_window_stats.update(tags)
+        if _reward_total % REWARD_DIAGNOSTIC_EVERY != 0:
+            return
 
-    avg_reward = _reward_sum / max(_reward_total, 1)
-    window_avg_reward = _reward_window_sum / max(_reward_window_total, 1)
-    key_order = [
+        avg_reward = _reward_sum / max(_reward_total, 1)
+        counts = " ".join(
+            f"{key}={_reward_stats[key]}"
+            for key in _reward_metric_keys()
+            if _reward_stats[key]
+        )
+    print(f"[reward] n={_reward_total} avg={avg_reward:.4f} {counts}", flush=True)
+
+
+def _reward_metric_keys() -> list[str]:
+    return [
         "correct",
         "wrong",
         "ideal_box",
@@ -553,37 +563,75 @@ def _record_reward_stats(tags: list[str], reward: float) -> None:
         "mcq_letter",
         "mcq_bad_shape",
     ]
-    counts = " ".join(f"{key}={_reward_stats[key]}" for key in key_order if _reward_stats[key])
-    print(f"[reward] n={_reward_total} avg={avg_reward:.4f} {counts}", flush=True)
 
-    window_metrics = {
+
+def _consume_reward_window_metrics(global_step: int) -> dict[str, float]:
+    global _reward_window_total, _reward_window_sum
+    with _reward_stats_lock:
+        if _reward_window_total <= 0:
+            return {}
+
+        window_total = _reward_window_total
+        window_stats = _reward_window_stats.copy()
+        window_avg_reward = _reward_window_sum / max(window_total, 1)
+        total = _reward_total
+
+        _reward_window_stats.clear()
+        _reward_window_total = 0
+        _reward_window_sum = 0.0
+
+    window_metrics: dict[str, float] = {
+        "train/global_step": float(global_step),
         "reward_debug/window_mean": window_avg_reward,
+        "reward_debug/window_completions": float(window_total),
+        "reward_debug/total_completions": float(total),
     }
-    for key in key_order:
+    for key in _reward_metric_keys():
         window_metrics[f"reward_debug/{key}_rate"] = (
-            _reward_window_stats[key] / max(_reward_window_total, 1)
+            window_stats[key] / max(window_total, 1)
         )
     for prefix in ["mcq", "multi", "single"]:
-        type_count = _reward_window_stats[f"{prefix}_count"]
-        window_metrics[f"reward_debug/{prefix}_count"] = type_count
+        type_count = window_stats[f"{prefix}_count"]
+        window_metrics[f"reward_debug/{prefix}_count"] = float(type_count)
         window_metrics[f"reward_debug/{prefix}_correct_rate"] = (
-            _reward_window_stats[f"{prefix}_correct"] / max(type_count, 1)
+            window_stats[f"{prefix}_correct"] / max(type_count, 1)
         )
         window_metrics[f"reward_debug/{prefix}_ideal_box_rate"] = (
-            _reward_window_stats[f"{prefix}_ideal_box"] / max(type_count, 1)
+            window_stats[f"{prefix}_ideal_box"] / max(type_count, 1)
         )
         window_metrics[f"reward_debug/{prefix}_clipped_rate"] = (
-            _reward_window_stats[f"{prefix}_clipped"] / max(type_count, 1)
+            window_stats[f"{prefix}_clipped"] / max(type_count, 1)
         )
-    try:
-        wandb.log(window_metrics)
-    except Exception as exc:
-        print(f"[reward] wandb log warning: {exc}", flush=True)
+    mcq_count = window_stats["mcq_count"]
+    window_metrics["reward_debug/mcq_letter_among_mcq_rate"] = (
+        window_stats["mcq_letter"] / max(mcq_count, 1)
+    )
+    window_metrics["reward_debug/mcq_bad_shape_among_mcq_rate"] = (
+        window_stats["mcq_bad_shape"] / max(mcq_count, 1)
+    )
+    return window_metrics
 
-    _reward_window_stats.clear()
-    _reward_window_total = 0
-    _reward_window_sum = 0.0
 
+class RewardDebugCallback(TrainerCallback):
+    """Log reward diagnostics on the same cadence as Trainer logging."""
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: dict[str, float] | None = None,
+        **kwargs: Any,
+    ) -> TrainerControl:
+        metrics = _consume_reward_window_metrics(state.global_step)
+        if metrics:
+            if logs is not None:
+                logs.update(metrics)
+            try:
+                wandb.log(metrics)
+            except Exception as exc:
+                print(f"[reward] wandb log warning: {exc}", flush=True)
+        return control
 
 def _type_tags(analysis: dict[str, Any]) -> list[str]:
     if analysis["is_mcq"]:
@@ -798,6 +846,11 @@ def main(args: argparse.Namespace) -> None:
             "clip_penalty": args.clip_penalty,
         },
     )
+    try:
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("reward_debug/*", step_metric="train/global_step")
+    except Exception as exc:
+        print(f"[wandb] metric definition warning: {exc}", flush=True)
 
     # Load problems and build curriculum dataset
     if args.deepmath_only:
@@ -882,6 +935,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Callbacks
     callbacks = [
+        RewardDebugCallback(),
         StopConditionCallback(eval_steps=LOGGING_STEPS),
     ]
     if args.use_drive_path or args.gdrive_remote:
