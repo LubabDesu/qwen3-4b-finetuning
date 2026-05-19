@@ -13,6 +13,7 @@ Use --use-drive-path to copy checkpoints directly to mounted Google Drive.
 
 import argparse
 import collections
+import contextlib
 import json
 import os
 import random
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+import judger as judger_module  # noqa: E402
 from judger import Judger  # noqa: E402
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -71,30 +74,24 @@ KL_COEF = 0.01
 GROUP_SIZE = 8
 MAX_PROMPT_TOKENS = 2048
 MAX_NEW_TOKENS = 6144
-REWARD_VALID_WRONG = 0.08
-REWARD_MISSING_THINK = -0.10
-REWARD_NO_FINAL_BOX = -0.10
-REWARD_EMPTY_FINAL_BOX = -0.20
-REWARD_MULTI_FINAL_BOX = -0.30
-REWARD_MULTI_ANSWER_MULTI_FINAL_BOX = -0.40
-REWARD_PRE_THINK_BOX_PENALTY = 0.10
-REWARD_PRE_THINK_BOX_PENALTY_CAP = 0.25
 REWARD_MULTI_ANSWER_COUNT_BONUS = 0.03
 REWARD_MULTI_ANSWER_COUNT_PENALTY = 0.05
 REWARD_MCQ_LETTER_BONUS = 0.03
 REWARD_MCQ_SHAPE_PENALTY = 0.05
-REWARD_WRONG_VALID_MAX = 0.12
 REWARD_FLOOR = -0.60
+REWARD_CAP = 1.00
 REWARD_DIAGNOSTIC_EVERY = 200
 STOP_FLAT_STEPS = 200       # stop if reward/mean flat for this many consecutive steps
 STOP_KL_MAX = 10.0          # stop if kl_divergence exceeds this
 STOP_LENGTH_MAX = 7000      # stop if mean response length exceeds this (tokens)
 STOP_STD_MIN = 0.05         # diagnostic only; low reward/std should not stop GRPO
 
-_strict_judger = Judger(strict_extract=True)
+_judger_local = threading.local()
+_judger_signal_lock = threading.Lock()
 _reward_stats: collections.Counter[str] = collections.Counter()
 _reward_total = 0
 _reward_sum = 0.0
+_reward_phase = "long"
 
 
 # ── Prompt formatting ────────────────────────────────────────────────────────
@@ -155,6 +152,17 @@ def load_public_grpo_train(path: Path = PUBLIC_GRPO_TRAIN_PATH) -> list[dict]:
     return problems
 
 
+def filter_by_min_difficulty(problems: list[dict], min_level: int | None) -> list[dict]:
+    if min_level is None:
+        return problems
+    filtered = [p for p in problems if int(p.get("difficulty_level", 0)) >= min_level]
+    print(
+        f"Filtered curriculum by difficulty_level >= {min_level}: "
+        f"{len(filtered)}/{len(problems)} rows"
+    )
+    return filtered
+
+
 def curriculum_weights(difficulties: np.ndarray, t: float) -> np.ndarray:
     """
     At t=0 (start): weight proportional to level (level 5=easiest gets highest weight).
@@ -209,6 +217,8 @@ def build_mixed_curriculum_dataset(
     curriculum_problems: list[dict],
     public_problems: list[dict],
     public_mix_ratio: float,
+    warmup_public_mix_ratio: float,
+    public_warmup_steps: int,
     total_steps: int,
     batch_size_per_step: int,
 ) -> Dataset:
@@ -217,7 +227,9 @@ def build_mixed_curriculum_dataset(
     non-public rows keep the easy-to-hard difficulty curriculum.
     """
     public_mix_ratio = min(max(public_mix_ratio, 0.0), 1.0)
-    if not public_problems or public_mix_ratio <= 0:
+    warmup_public_mix_ratio = min(max(warmup_public_mix_ratio, 0.0), 1.0)
+    public_warmup_steps = max(public_warmup_steps, 0)
+    if not public_problems or (public_mix_ratio <= 0 and warmup_public_mix_ratio <= 0):
         return build_curriculum_dataset(curriculum_problems, total_steps, batch_size_per_step)
 
     difficulties = np.array([p["difficulty_level"] for p in curriculum_problems])
@@ -226,11 +238,13 @@ def build_mixed_curriculum_dataset(
     rng = np.random.default_rng(seed=42)
     public_order = rng.permutation(n_public).tolist()
     public_cursor = 0
-    n_samples = total_steps * batch_size_per_step
-    n_public_samples = int(round(n_samples * public_mix_ratio))
-    public_sample_positions = set(
-        int(pos) for pos in rng.choice(n_samples, size=n_public_samples, replace=False)
-    )
+    public_sample_positions = set()
+    for step in range(total_steps):
+        ratio = warmup_public_mix_ratio if step < public_warmup_steps else public_mix_ratio
+        for inner in range(batch_size_per_step):
+            sample_pos = step * batch_size_per_step + inner
+            if rng.random() < ratio:
+                public_sample_positions.add(sample_pos)
 
     rows = []
     public_count = 0
@@ -263,48 +277,47 @@ def build_mixed_curriculum_dataset(
 
     print(
         f"Mixed curriculum dataset sampled {public_count} public prompts and "
-        f"{curriculum_count} curriculum prompts"
+        f"{curriculum_count} curriculum prompts "
+        f"(warmup_public_mix_ratio={warmup_public_mix_ratio}, "
+        f"public_warmup_steps={public_warmup_steps}, public_mix_ratio={public_mix_ratio})"
     )
     return Dataset.from_list(rows)
 
 
 # ── Reward function ──────────────────────────────────────────────────────────
 
-def _judge_strict(completion: str, gold: list[str], options: list[str]) -> bool:
+def _get_official_judger() -> Judger:
+    judger = getattr(_judger_local, "official_judger", None)
+    if judger is None:
+        judger = Judger(strict_extract=False)
+        _judger_local.official_judger = judger
+    return judger
+
+
+@contextlib.contextmanager
+def _disable_judger_alarm() -> Any:
+    old_signal = judger_module.signal.signal
+    old_alarm = judger_module.signal.alarm
+    judger_module.signal.signal = lambda *args, **kwargs: None
+    judger_module.signal.alarm = lambda *args, **kwargs: 0
     try:
-        return _strict_judger.auto_judge(pred=completion, gold=gold, options=options)
+        yield
+    finally:
+        judger_module.signal.signal = old_signal
+        judger_module.signal.alarm = old_alarm
+
+
+def _judge_official(completion: str, gold: list[str], options: list[str]) -> bool:
+    try:
+        with _judger_signal_lock:
+            with _disable_judger_alarm():
+                return _get_official_judger().auto_judge(
+                    pred=completion,
+                    gold=gold,
+                    options=options,
+                )
     except Exception:
         return False
-
-
-def _extract_boxed_values(text: str) -> list[str]:
-    values = []
-    start = 0
-    while True:
-        match = re.search(r"\\boxed\s*\{", text[start:])
-        if not match:
-            break
-        pos = start + match.end()
-        depth = 1
-        chars = []
-        while pos < len(text) and depth:
-            ch = text[pos]
-            if ch == "{":
-                depth += 1
-                chars.append(ch)
-            elif ch == "}":
-                depth -= 1
-                if depth:
-                    chars.append(ch)
-            else:
-                chars.append(ch)
-            pos += 1
-        if depth == 0:
-            values.append("".join(chars).strip())
-            start = pos
-        else:
-            break
-    return values
 
 
 def _split_think_sections(completion: str) -> tuple[str, str | None]:
@@ -365,92 +378,155 @@ def _split_top_level_commas(text: str) -> list[str]:
     return parts
 
 
-def _length_penalty(n_chars: int) -> float:
-    """Approximate char-to-token ratio ~4:1 for math text."""
-    n_tokens_approx = n_chars / 4.0
-    if n_tokens_approx <= 5000:
-        return 0.0
-    if n_tokens_approx <= 6000:
-        return 0.10 * (n_tokens_approx - 5000) / 1000
-    if n_tokens_approx <= 7000:
-        return 0.10 + 0.15 * (n_tokens_approx - 6000) / 1000
-    if n_tokens_approx <= 8192:
-        return 0.25 + 0.25 * (n_tokens_approx - 7000) / 1192
-    return 0.50
+def _approx_tokens(completion: str) -> float:
+    """Cheap token proxy for reward shaping."""
+    return max(1.0, len(completion) / 4.0)
+
+
+def _joined_box_answer(boxes: list[str]) -> str:
+    return ", ".join(str(box).strip() for box in boxes if str(box).strip())
 
 
 def _analyze_completion(completion: str, gold: list[str], options: list[str]) -> dict[str, Any]:
     before_think, after_think = _split_think_sections(completion)
-    pre_think_boxes = _extract_boxed_values(before_think)
-    final_boxes = _extract_boxed_values(after_think or "")
-    final_box = final_boxes[0].strip() if len(final_boxes) == 1 else ""
+    official_judger = _get_official_judger()
+    boxes_before = official_judger.extract_all_boxed(before_think)
+    boxes_after = official_judger.extract_all_boxed(after_think or "")
+    boxes_full = official_judger.extract_all_boxed(completion)
+    raw_box_count = completion.count("\\boxed{")
+    official_extract = official_judger.extract_ans(completion)
+    has_usable_box = bool(boxes_before or boxes_after or boxes_full)
+    has_think = after_think is not None
+    ideal_box = has_think and bool(boxes_after)
+    fallback_box_missing_think = not has_think and has_usable_box
+    prethink_box = has_think and not boxes_after and bool(boxes_before)
+    correct = _judge_official(completion, gold, options)
+    contiguous_count = len(boxes_before) + len(boxes_after)
     return {
-        "has_think": after_think is not None,
-        "pre_think_box_count": len(pre_think_boxes),
-        "final_boxes": final_boxes,
-        "final_box": final_box,
-        "final_box_count": len(final_boxes),
+        "completion": completion,
+        "tokens": _approx_tokens(completion),
+        "correct": correct,
+        "official_extract": official_extract,
+        "official_extractable": bool(official_extract),
+        "official_correct_no_usable_box": correct and not has_usable_box,
+        "has_think": has_think,
+        "has_box": raw_box_count > 0,
+        "has_usable_box": has_usable_box,
+        "ideal_box": ideal_box,
+        "fallback_box_missing_think": fallback_box_missing_think,
+        "prethink_box": prethink_box,
+        "is_scattered": has_usable_box and raw_box_count > max(contiguous_count, len(boxes_full), 1),
+        "empty_or_unusable_box": raw_box_count > 0 and not has_usable_box,
+        "boxes_before": boxes_before,
+        "boxes_after": boxes_after,
+        "boxes_full": boxes_full,
+        "raw_box_count": raw_box_count,
+        "answer_text": (
+            _joined_box_answer(boxes_after)
+            if boxes_after
+            else (_joined_box_answer(boxes_before) if boxes_before else official_extract)
+        ),
         "is_multi_answer": len(gold) > 1,
         "is_mcq": bool(options),
-        "length_penalty": _length_penalty(len(completion)),
     }
 
 
-def _structure_base_reward(analysis: dict[str, Any]) -> tuple[float | None, str]:
-    if not analysis["has_think"]:
-        return REWARD_MISSING_THINK, "missing_think"
-    final_box_count = analysis["final_box_count"]
-    if final_box_count == 0:
-        return REWARD_NO_FINAL_BOX, "no_final_box"
-    if final_box_count > 1:
-        if analysis["is_multi_answer"]:
-            return REWARD_MULTI_ANSWER_MULTI_FINAL_BOX, "multi_answer_multi_final_box"
-        return REWARD_MULTI_FINAL_BOX, "multi_final_box"
-    if not analysis["final_box"].strip():
-        return REWARD_EMPTY_FINAL_BOX, "empty_final_box"
-    return None, "valid_structure"
+def _no_usable_box_reward(tokens: float) -> float:
+    if _reward_phase == "closure":
+        if tokens <= 1000:
+            return -0.15
+        if tokens <= 2000:
+            return -0.35
+        return REWARD_FLOOR
+    if tokens <= 1500:
+        return -0.15
+    if tokens <= 3000:
+        return -0.35
+    return REWARD_FLOOR
 
 
-def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float, float, list[str]]:
+def _base_reward(analysis: dict[str, Any]) -> tuple[float, list[str]]:
+    correct = analysis["correct"]
+    tokens = analysis["tokens"]
+
+    if analysis["is_scattered"]:
+        return (0.20 if correct else -0.20), ["scattered_box", "correct" if correct else "wrong"]
+
+    if analysis["ideal_box"]:
+        return (1.00 if correct else 0.05), ["ideal_box", "correct" if correct else "wrong"]
+
+    if analysis["fallback_box_missing_think"]:
+        return (0.70 if correct else 0.02), ["fallback_missing_think", "correct" if correct else "wrong"]
+
+    if analysis["prethink_box"]:
+        return (0.45 if correct else -0.05), ["prethink_box", "correct" if correct else "wrong"]
+
+    if analysis["official_correct_no_usable_box"]:
+        if analysis["has_box"]:
+            return (0.20 if tokens <= 3000 else 0.05), ["correct_unusable_box"]
+        return (0.30 if tokens <= 3000 else 0.10), ["correct_no_box"]
+
+    if not analysis["has_usable_box"]:
+        return _no_usable_box_reward(tokens), ["no_usable_box"]
+
+    return -0.10, ["malformed_box"]
+
+
+def _shape_adjustment(analysis: dict[str, Any], gold: list[str]) -> tuple[float, list[str]]:
     adjustment = 0.0
-    penalties = 0.0
     tags = []
-    final_box = analysis["final_box"].strip()
+    answer_text = str(analysis["answer_text"]).strip()
 
     if analysis["is_multi_answer"]:
-        pred_parts = _split_top_level_commas(final_box)
+        pred_parts = _split_top_level_commas(answer_text)
         if len(pred_parts) == len(gold):
             adjustment += REWARD_MULTI_ANSWER_COUNT_BONUS
             tags.append("multi_count_match")
         else:
             adjustment -= REWARD_MULTI_ANSWER_COUNT_PENALTY
-            penalties -= REWARD_MULTI_ANSWER_COUNT_PENALTY
             tags.append("multi_count_mismatch")
 
     if analysis["is_mcq"]:
-        if re.fullmatch(r"[A-Ja-j]", final_box):
+        if re.fullmatch(r"[A-Ja-j]", answer_text):
             adjustment += REWARD_MCQ_LETTER_BONUS
             tags.append("mcq_letter")
         else:
             adjustment -= REWARD_MCQ_SHAPE_PENALTY
-            penalties -= REWARD_MCQ_SHAPE_PENALTY
             tags.append("mcq_bad_shape")
 
-    pre_think_penalty = min(
-        analysis["pre_think_box_count"] * REWARD_PRE_THINK_BOX_PENALTY,
-        REWARD_PRE_THINK_BOX_PENALTY_CAP,
-    )
-    if pre_think_penalty:
-        adjustment -= pre_think_penalty
-        penalties -= pre_think_penalty
-        tags.append("pre_think_box")
+    return adjustment, tags
 
-    if analysis["length_penalty"]:
-        adjustment -= analysis["length_penalty"]
-        penalties -= analysis["length_penalty"]
-        tags.append("length_penalized")
 
-    return adjustment, penalties, tags
+def _batch_relative_length_penalty(analysis: dict[str, Any], group: list[dict[str, Any]]) -> float:
+    if analysis["correct"] and analysis["ideal_box"]:
+        return 0.0
+
+    if not analysis["has_box"] and not analysis["official_correct_no_usable_box"]:
+        return 0.0
+
+    correct_lengths = [
+        item["tokens"]
+        for item in group
+        if item["correct"] and item["has_usable_box"]
+    ]
+
+    if correct_lengths:
+        if _reward_phase == "closure":
+            allowance = max(1000.0, 1.15 * (sum(correct_lengths) / len(correct_lengths)))
+        else:
+            allowance = max(1500.0, 1.25 * (sum(correct_lengths) / len(correct_lengths)))
+    elif _reward_phase == "closure":
+        allowance = 2500.0 if analysis["correct"] else 1800.0
+    else:
+        allowance = 5000.0 if analysis["correct"] else 3000.0
+
+    if analysis["tokens"] <= allowance:
+        return 0.0
+
+    excess_ratio = (analysis["tokens"] - allowance) / allowance
+    if analysis["correct"]:
+        return min(0.10 if _reward_phase == "closure" else 0.15, 0.08 * excess_ratio)
+    return min(0.35 if _reward_phase == "closure" else 0.40, (0.25 if _reward_phase == "closure" else 0.20) * excess_ratio)
 
 
 def _record_reward_stats(tags: list[str], reward: float) -> None:
@@ -464,45 +540,35 @@ def _record_reward_stats(tags: list[str], reward: float) -> None:
     avg_reward = _reward_sum / max(_reward_total, 1)
     key_order = [
         "correct",
-        "valid_wrong",
-        "missing_think",
-        "no_final_box",
-        "empty_final_box",
-        "multi_final_box",
-        "multi_answer_multi_final_box",
+        "wrong",
+        "ideal_box",
+        "fallback_missing_think",
+        "prethink_box",
+        "correct_no_box",
+        "correct_unusable_box",
+        "no_usable_box",
+        "malformed_box",
+        "scattered_box",
         "multi_count_match",
         "multi_count_mismatch",
         "mcq_letter",
         "mcq_bad_shape",
-        "pre_think_box",
         "length_penalized",
     ]
     counts = " ".join(f"{key}={_reward_stats[key]}" for key in key_order if _reward_stats[key])
     print(f"[reward] n={_reward_total} avg={avg_reward:.4f} {counts}", flush=True)
 
 
-def compute_reward(completion: str, gold: list[str], options: list[str]) -> float:
-    analysis = _analyze_completion(completion, gold, options)
-    malformed_reward, structure_tag = _structure_base_reward(analysis)
-    correct_strict = _judge_strict(completion, gold, options)
+def compute_reward(analysis: dict[str, Any], group: list[dict[str, Any]], gold: list[str]) -> float:
+    reward, tags = _base_reward(analysis)
+    adjustment, shape_tags = _shape_adjustment(analysis, gold)
+    length_penalty = _batch_relative_length_penalty(analysis, group)
+    if length_penalty:
+        tags.append("length_penalized")
 
-    if malformed_reward is not None:
-        reward = malformed_reward - analysis["length_penalty"]
-        tags = [structure_tag]
-        if analysis["length_penalty"]:
-            tags.append("length_penalized")
-    else:
-        adjustment, penalties, tags = _shape_adjustment(analysis, gold)
-        tags.append(structure_tag)
-        if correct_strict:
-            reward = 1.0 + penalties
-            tags.append("correct")
-        else:
-            reward = min(REWARD_WRONG_VALID_MAX, REWARD_VALID_WRONG + adjustment)
-            tags.append("valid_wrong")
-
-    reward = max(REWARD_FLOOR, float(reward))
-    _record_reward_stats(tags, reward)
+    reward = reward + adjustment - length_penalty
+    reward = min(REWARD_CAP, max(REWARD_FLOOR, float(reward)))
+    _record_reward_stats(tags + shape_tags, reward)
     return reward
 
 
@@ -513,11 +579,22 @@ def reward_fn(
     options: list[str],
     **kwargs: Any,
 ) -> list[float]:
-    rewards = []
-    for completion, gold_json, opts_json in zip(completions, gold_answer, options):
+    analyses = []
+    golds = []
+    group_map: dict[tuple[str, str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+
+    for prompt, completion, gold_json, opts_json in zip(prompts, completions, gold_answer, options):
         gold = json.loads(gold_json)
         opts = json.loads(opts_json)
-        rewards.append(compute_reward(completion, gold, opts))
+        analysis = _analyze_completion(completion, gold, opts)
+        analyses.append(analysis)
+        golds.append(gold)
+        group_map[(str(prompt), gold_json, opts_json)].append(analysis)
+
+    rewards = []
+    for prompt, analysis, gold_json, opts_json, gold in zip(prompts, analyses, gold_answer, options, golds):
+        group = group_map[(str(prompt), gold_json, opts_json)]
+        rewards.append(compute_reward(analysis, group, gold))
     return rewards
 
 
@@ -601,10 +678,17 @@ class StopConditionCallback(TrainerCallback):
 class RcloneBackupCallback(TrainerCallback):
     """Syncs checkpoint directory to Google Drive after each save."""
 
-    def __init__(self, gdrive_remote: str, local_dir: Path, use_drive_path: bool = False) -> None:
+    def __init__(
+        self,
+        gdrive_remote: str,
+        local_dir: Path,
+        use_drive_path: bool = False,
+        drive_checkpoint_dir: Path = DRIVE_CHECKPOINT_DIR,
+    ) -> None:
         self.gdrive_remote = gdrive_remote
         self.local_dir = local_dir
         self.use_drive_path = use_drive_path
+        self.drive_checkpoint_dir = drive_checkpoint_dir
 
     def on_save(
         self,
@@ -616,7 +700,7 @@ class RcloneBackupCallback(TrainerCallback):
         step = state.global_step
         checkpoint_path = self.local_dir / f"checkpoint-{step}"
         if self.use_drive_path:
-            target_path = DRIVE_CHECKPOINT_DIR / f"checkpoint-{step}"
+            target_path = self.drive_checkpoint_dir / f"checkpoint-{step}"
             print(f"\n[drive] Copying checkpoint-{step} to {target_path}...")
             try:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -648,6 +732,8 @@ class RcloneBackupCallback(TrainerCallback):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(args: argparse.Namespace) -> None:
+    global _reward_phase
+    _reward_phase = args.reward_phase
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     # WandB init
@@ -663,6 +749,10 @@ def main(args: argparse.Namespace) -> None:
             "total_steps": args.max_steps,
             "max_new_tokens": args.max_new_tokens,
             "public_mix_ratio": args.public_mix_ratio,
+            "reward_phase": args.reward_phase,
+            "min_difficulty_level": args.min_difficulty_level,
+            "public_warmup_steps": args.public_warmup_steps,
+            "warmup_public_mix_ratio": args.warmup_public_mix_ratio,
         },
     )
 
@@ -677,6 +767,10 @@ def main(args: argparse.Namespace) -> None:
         inference_partial = load_inference_partial()
         problems.extend(inference_partial)
         print(f"Loaded {len(problems)} total problems after adding partial inference rows")
+    effective_min_difficulty = args.min_difficulty_level
+    if effective_min_difficulty is None and args.reward_phase == "closure":
+        effective_min_difficulty = 4
+    problems = filter_by_min_difficulty(problems, effective_min_difficulty)
     public_problems = load_public_grpo_train(args.public_train_path)
 
     # One prompt per step; GRPO samples num_generations completions for that prompt.
@@ -685,6 +779,8 @@ def main(args: argparse.Namespace) -> None:
         problems,
         public_problems,
         args.public_mix_ratio,
+        args.warmup_public_mix_ratio,
+        args.public_warmup_steps,
         args.max_steps,
         batch_per_step,
     )
@@ -752,6 +848,7 @@ def main(args: argparse.Namespace) -> None:
                 args.gdrive_remote,
                 CHECKPOINT_DIR,
                 use_drive_path=args.use_drive_path,
+                drive_checkpoint_dir=args.drive_checkpoint_dir,
             )
         )
 
@@ -816,6 +913,25 @@ if __name__ == "__main__":
         help="Trainer checkpoint directory to resume from, e.g. checkpoints/grpo/checkpoint-300.",
     )
     parser.add_argument(
+        "--reward-phase",
+        choices=["closure", "long"],
+        default="long",
+        help=(
+            "Reward length shaping mode. closure is stricter and defaults to "
+            "difficulty_level >= 4; long is looser for hard reasoning."
+        ),
+    )
+    parser.add_argument(
+        "--min-difficulty-level",
+        type=int,
+        default=None,
+        help=(
+            "Keep only curriculum rows with difficulty_level >= this value. "
+            "Levels are inverted: 5 is easiest, 1 is hardest. Defaults to 4 "
+            "for --reward-phase closure and no filter for long."
+        ),
+    )
+    parser.add_argument(
         "--vllm-gpu-mem",
         type=float,
         default=0.6,
@@ -847,6 +963,18 @@ if __name__ == "__main__":
         help="Probability that each GRPO prompt comes from --public-train-path.",
     )
     parser.add_argument(
+        "--public-warmup-steps",
+        type=int,
+        default=0,
+        help="Use --warmup-public-mix-ratio for this many initial steps.",
+    )
+    parser.add_argument(
+        "--warmup-public-mix-ratio",
+        type=float,
+        default=0.0,
+        help="Public mix ratio during --public-warmup-steps.",
+    )
+    parser.add_argument(
         "--gdrive-remote",
         default="gdrive:151B",
         help="rclone remote:path for checkpoint backup (empty to disable)",
@@ -855,6 +983,12 @@ if __name__ == "__main__":
         "--use-drive-path",
         action="store_true",
         help=f"Copy checkpoints directly to mounted Drive path: {DRIVE_CHECKPOINT_DIR}",
+    )
+    parser.add_argument(
+        "--drive-checkpoint-dir",
+        type=Path,
+        default=DRIVE_CHECKPOINT_DIR,
+        help="Mounted Drive checkpoint directory used with --use-drive-path.",
     )
     args = parser.parse_args()
     main(args)
