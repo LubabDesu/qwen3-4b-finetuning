@@ -8,6 +8,7 @@ import collections
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,34 @@ Final answer rules:
 - Never round intermediate calculations.
 - Never round your final answer unless the problem explicitly asks you to round."""
 
+CONCLUSION_NUDGE = "We need to conclude now. Provide the final boxed answer."
+
+SPIRAL_PATTERNS = [
+    re.compile(pattern, flags=re.I)
+    for pattern in [
+        r"\bwait\b",
+        r"\bhold on\b",
+        r"\blet'?s check again\b",
+        r"\blet me check again\b",
+        r"\bdouble[- ]check\b",
+        r"\bre-?evaluate\b",
+        r"\bcorrection\b",
+        r"\bactually\b",
+        r"\bi made a mistake\b",
+        r"\blet'?s restart\b",
+        r"\bstart over\b",
+    ]
+]
+
+LINE_NORMALIZE_RE = re.compile(r"[^a-z0-9\\{}=+\-*/^().,]+", flags=re.I)
+
+
+@dataclass
+class GeneratedCandidate:
+    text: str
+    token_ids: list[int]
+    used_conclusion_nudge: bool = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rerun RS-SFT generation for MCQ prompts.")
@@ -34,9 +63,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-path", type=Path, required=True, help="Accepted SFT JSONL output.")
     parser.add_argument("--candidate-path", type=Path, required=True, help="All-candidate JSONL output.")
     parser.add_argument("--manifest-path", type=Path, default=None)
-    parser.add_argument("--num-generations", type=int, default=6)
+    parser.add_argument("--num-generations", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=3000)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-model-len", type=int, default=12288)
@@ -44,6 +73,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-num-seqs", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--conclusion-nudge-frac",
+        type=float,
+        default=0.8,
+        help="Generate this fraction of the token budget first, then continue unfinished candidates with a stripped conclusion nudge. Use 0 to disable.",
+    )
+    parser.add_argument("--conclusion-nudge", default=CONCLUSION_NUDGE)
+    parser.add_argument("--max-spiral-markers", type=int, default=2)
+    parser.add_argument("--max-duplicate-lines", type=int, default=1)
+    parser.add_argument("--max-repeated-ngram-ratio", type=float, default=0.10)
     return parser.parse_args()
 
 
@@ -134,6 +173,137 @@ def clean_completion(text: str) -> str:
     return text
 
 
+def count_spiral_markers(text: str) -> int:
+    return sum(len(pattern.findall(text)) for pattern in SPIRAL_PATTERNS)
+
+
+def normalized_nonempty_lines(text: str) -> list[str]:
+    lines = []
+    for raw_line in str(text or "").splitlines():
+        line = LINE_NORMALIZE_RE.sub(" ", raw_line.lower()).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def count_duplicate_lines(text: str) -> int:
+    counts = collections.Counter(normalized_nonempty_lines(text))
+    return sum(count - 1 for count in counts.values() if count > 1)
+
+
+def repeated_ngram_ratio(text: str, n: int = 5) -> float:
+    tokens = re.findall(r"[a-z0-9]+|\\[a-z]+|[{}=+\-*/^().,]", str(text or "").lower())
+    if len(tokens) < n * 2:
+        return 0.0
+    ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+    counts = collections.Counter(ngrams)
+    repeated = sum(count - 1 for count in counts.values() if count > 1)
+    return repeated / max(1, len(ngrams))
+
+
+def candidate_quality_metrics(text: str) -> dict[str, Any]:
+    return {
+        "spiral_markers": count_spiral_markers(text),
+        "duplicate_lines": count_duplicate_lines(text),
+        "repeated_ngram_ratio": repeated_ngram_ratio(text),
+    }
+
+
+def anti_spiral_reject_reason(metrics: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if metrics["spiral_markers"] > args.max_spiral_markers:
+        return "too_many_spiral_markers"
+    if metrics["duplicate_lines"] > args.max_duplicate_lines:
+        return "too_many_duplicate_lines"
+    if metrics["repeated_ngram_ratio"] > args.max_repeated_ngram_ratio:
+        return "repeated_ngram_ratio"
+    return None
+
+
+def candidate_score(tokens: int, metrics: dict[str, Any], used_conclusion_nudge: bool) -> float:
+    score = 0.0
+    score -= 3.0 * metrics["spiral_markers"]
+    score -= 4.0 * metrics["duplicate_lines"]
+    score -= 50.0 * metrics["repeated_ngram_ratio"]
+    score -= 0.001 * tokens
+    if used_conclusion_nudge:
+        score -= 2.0
+    return score
+
+
+def needs_conclusion_nudge(text: str) -> bool:
+    completion = clean_completion(text)
+    boxes = extract_all_boxed(completion)
+    return not (target_shape_ok(completion) and boxes)
+
+
+def generate_with_optional_nudge(llm: Any, prompts: list[str], args: argparse.Namespace, sampling_cls: Any) -> list[list[GeneratedCandidate]]:
+    use_nudge = 0.0 < args.conclusion_nudge_frac < 1.0
+    if not use_nudge:
+        sampling = sampling_cls(
+            n=args.num_generations,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_new_tokens,
+            stop=["<|im_end|>"],
+            seed=args.seed,
+        )
+        outputs = llm.generate(prompts, sampling)
+        return [
+            [GeneratedCandidate(text=cand.text, token_ids=list(cand.token_ids or [])) for cand in output.outputs]
+            for output in outputs
+        ]
+
+    first_tokens = max(1, int(args.max_new_tokens * args.conclusion_nudge_frac))
+    remaining_tokens = max(1, args.max_new_tokens - first_tokens)
+    first_sampling = sampling_cls(
+        n=args.num_generations,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=first_tokens,
+        stop=["<|im_end|>"],
+        seed=args.seed,
+    )
+    first_outputs = llm.generate(prompts, first_sampling)
+    grouped: list[list[GeneratedCandidate | None]] = []
+    continuation_prompts: list[str] = []
+    continuation_refs: list[tuple[int, int]] = []
+
+    for prompt_idx, (prompt, output) in enumerate(zip(prompts, first_outputs)):
+        prompt_candidates: list[GeneratedCandidate | None] = []
+        for cand_idx, cand in enumerate(output.outputs):
+            token_ids = list(cand.token_ids or [])
+            if needs_conclusion_nudge(cand.text):
+                prompt_candidates.append(None)
+                continuation_refs.append((prompt_idx, cand_idx))
+                continuation_prompts.append(f"{prompt}{cand.text}\n\n{args.conclusion_nudge}\n")
+            else:
+                prompt_candidates.append(GeneratedCandidate(text=cand.text, token_ids=token_ids))
+        grouped.append(prompt_candidates)
+
+    if continuation_prompts:
+        continuation_sampling = sampling_cls(
+            n=1,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=remaining_tokens,
+            stop=["<|im_end|>"],
+            seed=args.seed + 1,
+        )
+        continuation_outputs = llm.generate(continuation_prompts, continuation_sampling)
+        for (prompt_idx, cand_idx), output in zip(continuation_refs, continuation_outputs):
+            first_cand = first_outputs[prompt_idx].outputs[cand_idx]
+            continuation = output.outputs[0]
+            text = first_cand.text.rstrip() + "\n" + continuation.text.lstrip()
+            token_ids = list(first_cand.token_ids or []) + list(continuation.token_ids or [])
+            grouped[prompt_idx][cand_idx] = GeneratedCandidate(
+                text=text,
+                token_ids=token_ids,
+                used_conclusion_nudge=True,
+            )
+
+    return [[candidate for candidate in prompt_candidates if candidate is not None] for prompt_candidates in grouped]
+
+
 def target_shape_ok(text: str) -> bool:
     return (
         text.count("<think>") == 1
@@ -213,37 +383,43 @@ def main() -> None:
         enforce_eager=False,
         generation_config="vllm",
     )
-    sampling = SamplingParams(
-        n=args.num_generations,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_new_tokens,
-        stop=["<|im_end|>"],
-        seed=args.seed,
-    )
-
     stats: collections.Counter[str] = collections.Counter()
     accepted_total = existing_sft_rows
 
     for start in range(0, len(rows), args.batch_size):
         end = min(start + args.batch_size, len(rows))
         print(f"[mcq-rs] generating {start + 1}-{end} / {len(rows)}", flush=True)
-        outputs = llm.generate(prompts[start:end], sampling)
+        generated = generate_with_optional_nudge(llm, prompts[start:end], args, SamplingParams)
         batch_candidate_rows: list[dict[str, Any]] = []
         batch_sft_rows: list[dict[str, Any]] = []
-        for row, output in zip(rows[start:end], outputs):
+        for row, output_candidates in zip(rows[start:end], generated):
             gold = normalize_mcq_answer(row.get("gold_answer"))
             candidates = []
             selected = None
-            for cand_idx, cand in enumerate(output.outputs):
+            selected_score = None
+            selected_completion = None
+            selected_tokens = None
+            selected_metrics = None
+            selected_used_nudge = False
+            for cand_idx, cand in enumerate(output_candidates):
                 completion = clean_completion(cand.text)
                 boxes = extract_all_boxed(completion)
                 extracted = normalize_mcq_answer(boxes[-1] if boxes else "")
                 shape_ok = target_shape_ok(completion)
                 correct = bool(extracted and extracted == gold)
-                accepted = bool(correct and shape_ok)
-                reason = "" if accepted else ("incorrect" if not correct else "bad_target_shape")
+                metrics = candidate_quality_metrics(completion)
+                anti_spiral_reason = anti_spiral_reject_reason(metrics, args)
+                accepted = bool(correct and shape_ok and anti_spiral_reason is None)
+                if accepted:
+                    reason = ""
+                elif not correct:
+                    reason = "incorrect"
+                elif not shape_ok:
+                    reason = "bad_target_shape"
+                else:
+                    reason = anti_spiral_reason or "quality_filter"
                 tokens = len(cand.token_ids or [])
+                score = candidate_score(tokens, metrics, cand.used_conclusion_nudge) if accepted else None
                 candidates.append(
                     {
                         "candidate_index": cand_idx,
@@ -256,6 +432,9 @@ def main() -> None:
                         "completion_tokens": tokens,
                         "cleaned_tokens": tokens,
                         "under_preferred_cap": tokens <= args.max_new_tokens,
+                        "used_conclusion_nudge": cand.used_conclusion_nudge,
+                        "quality_score": score,
+                        "quality_metrics": metrics,
                         "structure": {
                             "has_think_close": "</think>" in completion,
                             "final_box_count": len(boxes),
@@ -267,11 +446,24 @@ def main() -> None:
                     }
                 )
                 stats[f"reject:{reason or 'accepted'}"] += 1
-                if accepted and selected is None:
+                if accepted and (selected_score is None or score > selected_score):
                     selected = cand_idx
-                    sft_row = make_sft_row(row, completion, cand_idx, tokens)
-                    sft_row["rs_sft"]["num_generations"] = args.num_generations
-                    batch_sft_rows.append(sft_row)
+                    selected_score = score
+                    selected_completion = completion
+                    selected_tokens = tokens
+                    selected_metrics = metrics
+                    selected_used_nudge = cand.used_conclusion_nudge
+
+            if selected is not None and selected_completion is not None and selected_tokens is not None:
+                sft_row = make_sft_row(row, selected_completion, selected, selected_tokens)
+                sft_row["rs_sft"]["num_generations"] = args.num_generations
+                sft_row["rs_sft"]["selection"] = {
+                    "method": "correct_then_anti_spiral_score",
+                    "quality_score": selected_score,
+                    "quality_metrics": selected_metrics,
+                    "used_conclusion_nudge": selected_used_nudge,
+                }
+                batch_sft_rows.append(sft_row)
 
             batch_candidate_rows.append(
                 {
@@ -288,6 +480,7 @@ def main() -> None:
                     "options": row.get("options") or [],
                     "accepted_count": sum(1 for c in candidates if c["accepted"]),
                     "selected_candidate_index": selected,
+                    "selection_method": "correct_then_anti_spiral_score",
                     "candidates": candidates,
                 }
             )
@@ -314,6 +507,11 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
+            "conclusion_nudge_frac": args.conclusion_nudge_frac,
+            "conclusion_nudge": args.conclusion_nudge,
+            "max_spiral_markers": args.max_spiral_markers,
+            "max_duplicate_lines": args.max_duplicate_lines,
+            "max_repeated_ngram_ratio": args.max_repeated_ngram_ratio,
             "stats": dict(stats),
         }
         args.manifest_path.parent.mkdir(parents=True, exist_ok=True)
