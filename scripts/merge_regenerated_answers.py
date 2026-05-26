@@ -24,6 +24,8 @@ def parse_args():
     ap.add_argument('--summary',type=Path,default=REPO_ROOT/'artifacts/private_reasoning_paths/regenerated_vote_summary.csv')
     ap.add_argument('--failed',type=Path,default=REPO_ROOT/'artifacts/private_reasoning_paths/failed_regen_rows.csv')
     ap.add_argument('--strong-votes',type=int,default=3,help='Minimum regenerated candidates agreeing before replacing a valid old answer.')
+    ap.add_argument('--only-ids',default='',help='Comma-separated IDs eligible for replacement. Empty means no allowlist.')
+    ap.add_argument('--block-ids',default='',help='Comma-separated IDs never eligible for replacement.')
     return ap.parse_args()
 
 
@@ -107,25 +109,109 @@ def has_corrupt_latex(s):
         return True
     if re.search(r'\\(?:frac|dfrac|tfrac)(?!\s*\{)', t):
         return True
+    if re.search(r'\\(?:frac|dfrac|tfrac)\s*\{[^{}]+\}\s*\{[^{}]+\}\s*[-+]?\d', t):
+        return True
     if re.search(r'\\sqrt(?!\s*(?:\{|\[))', t):
+        return True
+    if re.search(r'(?<!\\)\\(?![A-Za-z{}\[\](),.+\-*/^_\s])', t):
         return True
     return False
 
 
-def looks_like_explanation(s):
-    t=norm_text(s)
-    if len(t) > 120 or '\n' in str(s or ''):
+def question_asks_explanation(row):
+    q=str((row or {}).get('question','')).lower()
+    return any(p in q for p in ['explain', 'justify', 'show your work', 'why'])
+
+
+def looks_like_explanation(s, row=None):
+    if question_asks_explanation(row):
+        return False
+    raw=str(s or '')
+    t=norm_text(raw)
+    if len(t) > 120 or '\n' in raw:
         return True
-    if re.search(r'\b(the answer|therefore|because|since|we get|is equal to|option)\b', t, re.I):
+    if re.search(r'\b(because|since|therefore|p-value|option|we choose|the answer|we get|is equal to)\b', t, re.I):
         return True
     return len(re.findall(r'[A-Za-z]{3,}', t)) > 5
 
+
+
+
+def parse_id_set(s):
+    out=set()
+    for part in str(s or '').replace(' ', '').split(','):
+        if part:
+            out.add(int(part))
+    return out
+
+
+def allows_multi_for_single_blank(question):
+    q=str(question or '').lower()
+    patterns=[
+        'separate multiple answers by commas',
+        'more than one answer',
+        'find all',
+        'list all',
+        'all solutions',
+        'all values',
+        'select all',
+        'which statements',
+        'natural numbers',
+        'integers between',
+        'solutions to',
+        'solve ',
+        'solve for',
+        'solutions of',
+        'list the elements',
+        'list the',
+        'values of',
+        'roots',
+    ]
+    return any(p in q for p in patterns)
+
+
+def is_multi_value_question(row):
+    q=(row.get('question') or '') if row else ''
+    return q.count('[ANS]') > 1 or allows_multi_for_single_blank(q)
+
+
+def answer_component_count(ans, row):
+    text=norm_text(ans)
+    opts=(row or {}).get('options')
+    if isinstance(opts, list) and opts and re.fullmatch(r'[A-Ja-j]+', text):
+        return len(text)
+    return len(split_top_level(text)) if text else 0
+
+
+def collapsed_multi_value(old_key, new_key, row):
+    return (
+        old_key is not None
+        and new_key is not None
+        and is_multi_value_question(row)
+        and answer_component_count(old_key, row) > 1
+        and answer_component_count(new_key, row) == 1
+    )
+
+
+def normalize_option_component(part, opts):
+    letters=re.findall(r'(?<![A-Za-z])([A-J])(?![A-Za-z])', norm_text(part), re.I)
+    if letters:
+        return letters[0].upper()
+    return option_value_to_letter(part, opts)
 
 def normalize_answer(ans, row):
     ans=norm_text(ans)
     if ans.lower() in BAD: return None
     opts=row.get('options')
+    question=row.get('question') or ''
+    n=question.count('[ANS]')
+    parts=split_top_level(ans)
     if isinstance(opts,list) and opts:
+        if n>1:
+            if len(parts)!=n: return None
+            mapped=[normalize_option_component(p, opts) for p in parts]
+            if any(not m for m in mapped): return None
+            return ', '.join(mapped)
         tokens=re.findall(r'(?<![A-Za-z])([A-J])(?![A-Za-z])', ans, re.I)
         if tokens:
             letters=[]
@@ -135,26 +221,45 @@ def normalize_answer(ans, row):
             return ''.join(letters) if letters else None
         mapped=option_value_to_letter(ans, opts)
         return mapped
-    n=(row.get('question') or '').count('[ANS]')
     if n>1:
-        parts=split_top_level(ans)
         if len(parts)!=n: return None
         return ', '.join(canon_part(p) for p in parts)
-    parts=split_top_level(ans)
-    if len(parts)>1: return None
+    if len(parts)>1 and not allows_multi_for_single_blank(question):
+        return None
+    if len(parts)>1:
+        return ', '.join(canon_part(p) for p in parts)
     return canon_part(ans)
 
 
 def strict_normalize_answer(ans, row):
     if not str(ans or '').strip():
         return None
-    if has_corrupt_latex(ans) or looks_like_explanation(ans):
+    if has_corrupt_latex(ans) or looks_like_explanation(ans, row):
         return None
     key=normalize_answer(ans, row)
-    if not key or looks_like_explanation(key):
+    if not key or looks_like_explanation(key, row):
         return None
     return key
 
+
+
+
+def clean_raw_answer(ans):
+    t=str(ans or '').strip()
+    t=re.sub(r'^\\boxed\s*\{(.*)\}$', r'\1', t, flags=re.S).strip()
+    t=re.sub(r'\s*,\s*', ', ', t)
+    return t
+
+
+def format_final_answer(win):
+    raw=clean_raw_answer(win.get('answer') or '')
+    key=win.get('key') or raw
+    parts=split_top_level(str(key or ''))
+    if parts and all(re.fullmatch(r'[A-Ja-j]', norm_text(p)) for p in parts):
+        return ', '.join(norm_text(p).upper() for p in parts)
+    if re.fullmatch(r'[A-Ja-j]+', norm_text(key)):
+        return norm_text(key).upper()
+    return raw or key
 
 def extract_answer(judger, text):
     try:
@@ -172,6 +277,8 @@ def wait_count(s): return len(re.findall(r'\b(wait|hold on|maybe|not sure|confus
 def main():
     args=parse_args(); judger=Judger()
     hard=set(read_hard_ids(args.hard_rows)); private=read_private(args.private)
+    only_ids=parse_id_set(args.only_ids)
+    block_ids=parse_id_set(args.block_ids)
     draft_rows=[]; old_by_id={}
     with args.draft.open(encoding='utf-8',newline='') as f:
         for row in csv.DictReader(f):
@@ -208,24 +315,32 @@ def main():
         win=pool[0]
         regen_votes=sum(1 for v in vals if v['source']=='regen' and v['key']==win['key'])
         strong_agreement=regen_votes >= args.strong_votes
-        accepted=win['source']=='regen' and (old_invalid or strong_agreement)
+        id_allowed=(not only_ids or qid in only_ids) and qid not in block_ids
+        collapse=collapsed_multi_value(old_key, win['key'], private[qid])
+        accepted=id_allowed and win['source']=='regen' and (old_invalid or strong_agreement) and not collapse
         if accepted:
             winners[qid]=win
         else:
-            failed.append({'id':qid,'reason':'old_valid_and_no_strong_regen_vote' if win['source']=='regen' else 'old_answer_won'})
-        summaries.append({'id':qid,'winner':win['key'],'winner_source':win['source'],'accepted':accepted,'old_invalid':old_invalid,'votes':top_count,'regen_votes':regen_votes,'num_valid_candidates':len(vals),'vote_counts':json.dumps(counts,sort_keys=True),'temperature':win.get('temperature'),'waits':win.get('waits')})
+            if not id_allowed:
+                reason='blocked_or_not_allowlisted'
+            elif collapse:
+                reason='collapsed_multi_value'
+            else:
+                reason='old_valid_and_no_strong_regen_vote' if win['source']=='regen' else 'old_answer_won'
+            failed.append({'id':qid,'reason':reason})
+        summaries.append({'id':qid,'winner':win['key'],'winner_source':win['source'],'accepted':accepted,'old_invalid':old_invalid,'collapsed_multi_value':collapse,'votes':top_count,'regen_votes':regen_votes,'num_valid_candidates':len(vals),'vote_counts':json.dumps(counts,sort_keys=True),'temperature':win.get('temperature'),'waits':win.get('waits')})
     out_rows=[]
     for row in draft_rows:
         qid=int(row['id']); resp=row['response'] or ''
         if qid in winners:
-            ans=winners[qid]['key']
+            ans=format_final_answer(winners[qid])
             resp=resp.rstrip()+f"\n\nFinal answer: \\boxed{{{ans}}}"
         out_rows.append({'id':str(qid),'response':resp})
     args.output.parent.mkdir(parents=True,exist_ok=True)
     with args.output.open('w',encoding='utf-8',newline='') as f:
         w=csv.DictWriter(f,fieldnames=['id','response'],quoting=csv.QUOTE_ALL); w.writeheader(); w.writerows(out_rows)
     with args.summary.open('w',encoding='utf-8',newline='') as f:
-        fields=['id','winner','winner_source','accepted','old_invalid','votes','regen_votes','num_valid_candidates','vote_counts','temperature','waits']
+        fields=['id','winner','winner_source','accepted','old_invalid','collapsed_multi_value','votes','regen_votes','num_valid_candidates','vote_counts','temperature','waits']
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(summaries)
     with args.failed.open('w',encoding='utf-8',newline='') as f:
         w=csv.DictWriter(f,fieldnames=['id','reason']); w.writeheader(); w.writerows(failed)
