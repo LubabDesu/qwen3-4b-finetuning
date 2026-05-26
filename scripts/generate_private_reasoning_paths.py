@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Iterator
@@ -99,6 +100,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional text file overriding the built-in system prompt.",
+    )
+    parser.add_argument(
+        "--token-limit-injection-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Optional two-pass continuation mode. First generate this fraction of "
+            "--max-tokens; continuations that hit length without a boxed answer are "
+            "continued with --token-limit-injection-prompt for the remaining budget."
+        ),
+    )
+    parser.add_argument(
+        "--token-limit-injection-prompt",
+        default=(
+            "\n\nYou are close to the token limit. Stop deriving, do not restart, "
+            "and give exactly one final answer now in \\boxed{}."
+        ),
+        help="Instruction appended before continuing length-limited generations with no boxed answer.",
     )
     return parser.parse_args()
 
@@ -252,18 +271,33 @@ def init_vllm(args: argparse.Namespace) -> tuple[Any, Any]:
     return llm, tokenizer
 
 
-def build_sampling_params(args: argparse.Namespace) -> Any:
+BOXED_RE = re.compile(r"\\boxed\s*\{")
+
+
+def has_boxed_answer(text: str) -> bool:
+    return bool(BOXED_RE.search(text or ""))
+
+
+def build_sampling_params(args: argparse.Namespace, *, max_tokens: int | None = None, n: int | None = None) -> Any:
     from vllm import SamplingParams
 
     return SamplingParams(
-        n=args.num_samples,
+        n=args.num_samples if n is None else n,
         temperature=args.temperature,
         min_p=args.min_p,
         top_p=args.top_p,
-        max_tokens=args.max_tokens,
+        max_tokens=args.max_tokens if max_tokens is None else max_tokens,
         seed=args.seed,
         stop=["<|im_end|>", "<|endoftext|>"],
     )
+
+
+def candidate_hit_length(candidate: Any, budget: int) -> bool:
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason == "length":
+        return True
+    token_ids = getattr(candidate, "token_ids", None)
+    return token_ids is not None and len(token_ids) >= budget
 
 
 def main() -> None:
@@ -282,6 +316,8 @@ def main() -> None:
             "[paths] warning: --max-num-seqs is lower than --batch-size; throughput may be limited.",
             file=sys.stderr,
         )
+    if args.token_limit_injection_ratio is not None and not (0.0 < args.token_limit_injection_ratio < 1.0):
+        raise SystemExit("--token-limit-injection-ratio must be between 0 and 1")
     if args.output.exists() and not args.resume and not args.skip_existing_output_check:
         raise SystemExit(
             f"Refusing to append to existing output with --no-resume: {args.output}. "
@@ -308,7 +344,19 @@ def main() -> None:
         print(f"[paths] resume: found {len(completed_ids)} completed question_ids", flush=True)
 
     llm, tokenizer = init_vllm(args)
-    sampling = build_sampling_params(args)
+    injection_enabled = args.token_limit_injection_ratio is not None
+    first_pass_tokens = args.max_tokens
+    continuation_tokens = 0
+    if injection_enabled:
+        first_pass_tokens = max(1, int(args.max_tokens * args.token_limit_injection_ratio))
+        continuation_tokens = max(1, args.max_tokens - first_pass_tokens)
+        print(
+            f"[paths] token-limit injection enabled: first_pass_tokens={first_pass_tokens} "
+            f"continuation_tokens={continuation_tokens}",
+            flush=True,
+        )
+    sampling = build_sampling_params(args, max_tokens=first_pass_tokens)
+    continuation_sampling = build_sampling_params(args, max_tokens=continuation_tokens, n=1) if injection_enabled else None
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     processed = 0
@@ -329,8 +377,43 @@ def main() -> None:
         ):
             rendered_prompts = [item["rendered_prompt"] for item in batch]
             outputs = llm.generate(rendered_prompts, sampling)
+            continuation_jobs: list[dict[str, Any]] = []
+            batch_generations: list[list[str]] = []
             for item, output in zip(batch, outputs):
-                generations = [candidate.text.strip() for candidate in output.outputs]
+                generations: list[str] = []
+                for sample_idx, candidate in enumerate(output.outputs):
+                    text = candidate.text.strip()
+                    generations.append(text)
+                    if (
+                        injection_enabled
+                        and not has_boxed_answer(text)
+                        and candidate_hit_length(candidate, first_pass_tokens)
+                    ):
+                        continuation_jobs.append(
+                            {
+                                "row_idx": len(batch_generations),
+                                "sample_idx": sample_idx,
+                                "prompt": item["rendered_prompt"] + text + args.token_limit_injection_prompt,
+                            }
+                        )
+                batch_generations.append(generations)
+
+            if continuation_jobs:
+                print(
+                    f"[paths] token-limit injection: continuing {len(continuation_jobs)} "
+                    f"length-limited unboxed samples",
+                    flush=True,
+                )
+                continuation_prompts = [job["prompt"] for job in continuation_jobs]
+                continuation_outputs = llm.generate(continuation_prompts, continuation_sampling)
+                for job, cont_output in zip(continuation_jobs, continuation_outputs):
+                    continuation = cont_output.outputs[0].text.strip() if cont_output.outputs else ""
+                    row_idx = job["row_idx"]
+                    sample_idx = job["sample_idx"]
+                    combined = (batch_generations[row_idx][sample_idx].rstrip() + "\n" + continuation).strip()
+                    batch_generations[row_idx][sample_idx] = combined
+
+            for item, generations in zip(batch, batch_generations):
                 out_row = {
                     "question_id": item["question_id"],
                     "prompt": item["prompt"],

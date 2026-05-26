@@ -256,8 +256,12 @@ def recover_best_candidate(args: argparse.Namespace, judger: Judger, row: dict[s
             repaired = repair_to_single_final_box(raw_completion, normalized)
             metrics = candidate_quality_metrics(repaired)
             anti_spiral = anti_spiral_reject_reason(metrics, args)
-            correct = judge_answer(judger, row, repaired, normalized)
-            accepted = bool((correct or args.keep_incorrect) and target_shape_ok(repaired) and anti_spiral is None)
+            shape_ok = target_shape_ok(repaired)
+            if (anti_spiral is not None or not shape_ok) and not args.keep_incorrect:
+                correct = False
+            else:
+                correct = judge_answer(judger, row, repaired, normalized)
+            accepted = bool((correct or args.keep_incorrect) and shape_ok and anti_spiral is None)
             tokens = int(cand.get("completion_tokens") or cand.get("cleaned_tokens") or 0)
             score = candidate_score(tokens, metrics, bool(cand.get("used_conclusion_nudge")))
             diagnostics.append(

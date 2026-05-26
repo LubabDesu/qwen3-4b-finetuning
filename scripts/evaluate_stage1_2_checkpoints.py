@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import gc
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -191,6 +193,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Sample exactly this many non-MCQ rows from public eval.",
     )
+    parser.add_argument(
+        "--anti-spiral-retry",
+        action="store_true",
+        help="Retry eval rows whose first response fails format checks or looks like a reasoning spiral.",
+    )
+    parser.add_argument(
+        "--anti-spiral-retry-prompt",
+        default=(
+            "The previous attempt may have looped or over-checked itself. Solve once cleanly, "
+            "avoid restarting, and end with exactly one final \\boxed{} answer."
+        ),
+        help="Extra system instruction used only for anti-spiral retry generations.",
+    )
+    parser.add_argument("--anti-spiral-max-markers", type=int, default=2)
+    parser.add_argument("--anti-spiral-max-duplicate-lines", type=int, default=1)
+    parser.add_argument("--anti-spiral-max-repeated-ngram-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--anti-spiral-retry-format-failures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also retry responses that fail the normal boxed-format check.",
+    )
     return parser.parse_args()
 
 
@@ -265,6 +289,120 @@ def dedupe_eval_rows(eval_rows: list[dict[str, Any]], stage_name: str) -> list[d
     return unique_rows
 
 
+SPIRAL_PATTERNS = [
+    re.compile(pattern, flags=re.I)
+    for pattern in [
+        r"\bwait\b",
+        r"\bhold on\b",
+        r"\blet'?s check again\b",
+        r"\blet me check again\b",
+        r"\bdouble[- ]check\b",
+        r"\bre-?evaluate\b",
+        r"\bcorrection\b",
+        r"\bactually\b",
+        r"\bi made a mistake\b",
+        r"\blet'?s restart\b",
+        r"\bstart over\b",
+    ]
+]
+LINE_NORMALIZE_RE = re.compile(r"[^a-z0-9\\{}=+\-*/^().,]+", flags=re.I)
+
+
+def count_spiral_markers(text: str) -> int:
+    return sum(len(pattern.findall(text or "")) for pattern in SPIRAL_PATTERNS)
+
+
+def count_duplicate_lines(text: str) -> int:
+    counts = collections.Counter(
+        line
+        for raw_line in str(text or "").splitlines()
+        for line in [LINE_NORMALIZE_RE.sub(" ", raw_line.lower()).strip()]
+        if line
+    )
+    return sum(count - 1 for count in counts.values() if count > 1)
+
+
+def repeated_ngram_ratio(text: str, n: int = 5) -> float:
+    tokens = re.findall(r"[a-z0-9]+|\\[a-z]+|[{}=+\-*/^().,]", str(text or "").lower())
+    if len(tokens) < n * 2:
+        return 0.0
+    ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+    counts = collections.Counter(ngrams)
+    repeated = sum(count - 1 for count in counts.values() if count > 1)
+    return repeated / max(1, len(ngrams))
+
+
+def response_quality_metrics(response: str) -> dict[str, Any]:
+    return {
+        "spiral_markers": count_spiral_markers(response),
+        "duplicate_lines": count_duplicate_lines(response),
+        "repeated_ngram_ratio": repeated_ngram_ratio(response),
+    }
+
+
+def anti_spiral_retry_reason(response: str, format_ok: bool, args: argparse.Namespace) -> str | None:
+    if args.anti_spiral_retry_format_failures and not format_ok:
+        return "format_not_ok"
+    metrics = response_quality_metrics(response)
+    if metrics["spiral_markers"] > args.anti_spiral_max_markers:
+        return "too_many_spiral_markers"
+    if metrics["duplicate_lines"] > args.anti_spiral_max_duplicate_lines:
+        return "too_many_duplicate_lines"
+    if metrics["repeated_ngram_ratio"] > args.anti_spiral_max_repeated_ngram_ratio:
+        return "repeated_ngram_ratio"
+    return None
+
+
+def make_eval_result_row(ns: SimpleNamespace, item: dict[str, Any], response: str) -> dict[str, Any]:
+    is_mcq = bool(item.get("options"))
+    is_multi = (not is_mcq) and ns.count_ans_blanks(item.get("question", "")) > 1
+    if item.get("eval_source") == "public":
+        ok = ns.score_public_item(item, response)
+    else:
+        ok = ns.score_math_item(item, response)
+    fmt_ok = ns.boxed_format_ok(
+        item.get("question", ""),
+        response,
+        is_mcq=is_mcq,
+        options=item.get("options"),
+    )
+    return {
+        "id": item.get("id"),
+        "eval_source": item.get("eval_source"),
+        "is_mcq": is_mcq,
+        "is_multi": is_multi,
+        "question": item.get("question"),
+        "options": item.get("options"),
+        "gold": item.get("answer"),
+        "response": response,
+        "correct": ok,
+        "format_ok": fmt_ok,
+        "word_count": ns.response_word_count(response),
+    }
+
+
+def generate_anti_spiral_retries(
+    ns: SimpleNamespace,
+    llm: Any,
+    tokenizer: Any,
+    retry_items: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[str]:
+    from vllm import SamplingParams
+
+    system_prompt = f"{ns.EVAL_SYSTEM_PROMPT.rstrip()}\n\n{args.anti_spiral_retry_prompt.strip()}"
+    prompts = [ns.build_vllm_prompt(tokenizer, item, system_prompt=system_prompt) for item in retry_items]
+    sampling_params = SamplingParams(
+        temperature=ns.EVAL_VLLM_TEMPERATURE,
+        top_p=ns.VLLM_TOP_P,
+        top_k=ns.VLLM_TOP_K,
+        repetition_penalty=ns.VLLM_REPETITION_PENALTY,
+        max_tokens=ns.EVAL_MAX_NEW_TOKENS,
+    )
+    outputs = llm.generate(prompts, sampling_params)
+    return [out.outputs[0].text.strip() if out.outputs else "" for out in outputs]
+
+
 def load_existing_result_rows(eval_dir: Path, stage_name: str) -> list[dict[str, Any]]:
     paths = [
         eval_dir / f"{stage_name}_eval_results.jsonl",
@@ -329,7 +467,7 @@ def write_jsonl(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def install_resumable_evaluate_model(ns: SimpleNamespace, args: argparse.Namespace) -> None:
-    if not args.resume_existing:
+    if not args.resume_existing and not args.anti_spiral_retry:
         return
 
     def evaluate_model_resumable(
@@ -348,7 +486,7 @@ def install_resumable_evaluate_model(ns: SimpleNamespace, args: argparse.Namespa
             eval_rows = eval_rows[:limit]
         eval_rows = dedupe_eval_rows(eval_rows, stage_name)
 
-        existing_rows = load_existing_result_rows(ns.EVAL_DIR, stage_name)
+        existing_rows = load_existing_result_rows(ns.EVAL_DIR, stage_name) if args.resume_existing else []
         eval_ids = {eval_row_id(row, index) for index, row in enumerate(eval_rows)}
         existing_by_id = {
             eval_row_id(row): row
@@ -395,33 +533,37 @@ def install_resumable_evaluate_model(ns: SimpleNamespace, args: argparse.Namespa
                 )
                 batch_result_rows = []
 
-                for item_index, (item, response) in enumerate(zip(batch, responses), start=start):
-                    is_mcq = bool(item.get("options"))
-                    is_multi = (not is_mcq) and ns.count_ans_blanks(item.get("question", "")) > 1
-                    if item.get("eval_source") == "public":
-                        ok = ns.score_public_item(item, response)
-                    else:
-                        ok = ns.score_math_item(item, response)
-                    fmt_ok = ns.boxed_format_ok(
-                        item.get("question", ""),
-                        response,
-                        is_mcq=is_mcq,
-                        options=item.get("options"),
+                batch_rows_by_pos = [make_eval_result_row(ns, item, response) for item, response in zip(batch, responses)]
+                retry_positions: list[int] = []
+                retry_reasons: list[str] = []
+                if args.anti_spiral_retry:
+                    for pos, row in enumerate(batch_rows_by_pos):
+                        reason = anti_spiral_retry_reason(row["response"], bool(row.get("format_ok")), args)
+                        if reason is not None:
+                            retry_positions.append(pos)
+                            retry_reasons.append(reason)
+
+                if retry_positions:
+                    retry_items = [batch[pos] for pos in retry_positions]
+                    print(
+                        f"[checkpoint_eval] {stage_name}: anti-spiral retry "
+                        f"{len(retry_positions)}/{len(batch)} rows; reasons={collections.Counter(retry_reasons)}",
+                        flush=True,
                     )
-                    words = ns.response_word_count(response)
-                    row = {
-                        "id": item.get("id"),
-                        "eval_source": item.get("eval_source"),
-                        "is_mcq": is_mcq,
-                        "is_multi": is_multi,
-                        "question": item.get("question"),
-                        "options": item.get("options"),
-                        "gold": item.get("answer"),
-                        "response": response,
-                        "correct": ok,
-                        "format_ok": fmt_ok,
-                        "word_count": words,
-                    }
+                    retry_responses = generate_anti_spiral_retries(ns, llm, tokenizer, retry_items, args)
+                    for pos, reason, retry_response in zip(retry_positions, retry_reasons, retry_responses):
+                        original = batch_rows_by_pos[pos]
+                        retried = make_eval_result_row(ns, batch[pos], retry_response)
+                        retried["inference_retried"] = True
+                        retried["retry_reason"] = reason
+                        retried["retry_metrics"] = response_quality_metrics(original["response"])
+                        retried["original_response"] = original["response"]
+                        retried["original_correct"] = original["correct"]
+                        retried["original_format_ok"] = original["format_ok"]
+                        batch_rows_by_pos[pos] = retried
+
+                for item_index, (item, row) in enumerate(zip(batch, batch_rows_by_pos), start=start):
+                    row.setdefault("inference_retried", False)
                     generated_by_id[eval_row_id(item, item_index)] = row
                     batch_result_rows.append(row)
 
@@ -457,7 +599,12 @@ def install_resumable_evaluate_model(ns: SimpleNamespace, args: argparse.Namespa
         return metrics
 
     ns.evaluate_model = evaluate_model_resumable
-    print("[checkpoint_eval] resume mode enabled: existing result ids will be skipped", flush=True)
+    modes = []
+    if args.resume_existing:
+        modes.append("resume mode enabled: existing result ids will be skipped")
+    if args.anti_spiral_retry:
+        modes.append("anti-spiral retry enabled")
+    print(f"[checkpoint_eval] {'; '.join(modes)}", flush=True)
 
 
 def load_public_eval_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
