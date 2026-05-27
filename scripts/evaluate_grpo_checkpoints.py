@@ -98,11 +98,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log rclone sync failures without failing the eval run.",
     )
-    parser.add_argument("--rclone-transfers", type=int, default=4, help="rclone --transfers value for Drive copies.")
-    parser.add_argument("--rclone-checkers", type=int, default=4, help="rclone --checkers value for Drive copies.")
+    parser.add_argument(
+        "--run-label",
+        default=None,
+        help=(
+            "Optional label prepended to eval output names, for example "
+            "'public_val_rest_300_l4'."
+        ),
+    )
+    parser.add_argument(
+        "--delete-local-checkpoint-after-eval",
+        action="store_true",
+        help=(
+            "After each checkpoint finishes eval/sync, delete the local checkpoint "
+            "folder if this run downloaded it from --drive-source."
+        ),
+    )
+    parser.add_argument("--rclone-transfers", type=int, default=1, help="rclone --transfers value for Drive copies.")
+    parser.add_argument("--rclone-checkers", type=int, default=1, help="rclone --checkers value for Drive copies.")
     parser.add_argument("--rclone-drive-chunk-size", default="128M", help="rclone --drive-chunk-size value.")
-    parser.add_argument("--rclone-tpslimit", type=float, default=None, help="Optional rclone --tpslimit value.")
-    parser.add_argument("--rclone-tpslimit-burst", type=int, default=None, help="Optional rclone --tpslimit-burst value.")
+    parser.add_argument("--rclone-tpslimit", type=float, default=2.0, help="Optional rclone --tpslimit value.")
+    parser.add_argument("--rclone-tpslimit-burst", type=int, default=4, help="Optional rclone --tpslimit-burst value.")
+    parser.add_argument("--rclone-drive-pacer-min-sleep", default="2s", help="rclone --drive-pacer-min-sleep value.")
+    parser.add_argument("--rclone-drive-pacer-burst", type=int, default=1, help="rclone --drive-pacer-burst value.")
     parser.add_argument("--rclone-retries", type=int, default=10, help="rclone --retries value.")
     parser.add_argument("--rclone-low-level-retries", type=int, default=20, help="rclone --low-level-retries value.")
     parser.add_argument(
@@ -509,6 +527,8 @@ def rclone_common_args(args: argparse.Namespace) -> list[str]:
         f"--transfers={args.rclone_transfers}",
         f"--checkers={args.rclone_checkers}",
         f"--drive-chunk-size={args.rclone_drive_chunk_size}",
+        f"--drive-pacer-min-sleep={args.rclone_drive_pacer_min_sleep}",
+        f"--drive-pacer-burst={args.rclone_drive_pacer_burst}",
         f"--retries={args.rclone_retries}",
         f"--low-level-retries={args.rclone_low_level_retries}",
         "--log-level",
@@ -521,10 +541,10 @@ def rclone_common_args(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
-def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None, args: argparse.Namespace) -> None:
+def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None, args: argparse.Namespace) -> bool:
     adapter_path = checkpoint_dir / "adapter_model.safetensors"
     if adapter_path.exists():
-        return
+        return False
     if not drive_source:
         raise FileNotFoundError(f"Missing local checkpoint and no --drive-source was provided: {checkpoint_dir}")
 
@@ -547,6 +567,7 @@ def ensure_local_checkpoint(checkpoint_dir: Path, drive_source: str | None, args
         raise RuntimeError(f"rclone copy failed for {remote} with exit code {result.returncode}")
     if not adapter_path.exists():
         raise FileNotFoundError(f"Downloaded checkpoint is missing adapter_model.safetensors: {checkpoint_dir}")
+    return True
 
 
 def discover_checkpoint_steps(checkpoint_root: Path) -> list[int]:
@@ -717,7 +738,8 @@ def apply_vllm_overrides(ns: SimpleNamespace, args: argparse.Namespace) -> None:
 
 def evaluate_base_model(ns: SimpleNamespace, args: argparse.Namespace, eval_rows: list[dict[str, Any]]) -> None:
     model_name_or_path = args.base_model or ns.BASE_MODEL
-    stage_name = args.base_stage_name or ("grpo_base_public" if args.public_only else "grpo_base_eval")
+    base_stage_name = args.base_stage_name or ("grpo_base_public" if args.public_only else "grpo_base_eval")
+    stage_name = f"{args.run_label}_{base_stage_name}" if args.run_label else base_stage_name
     summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
     if args.skip_existing and summary_path.exists():
         print(f"[checkpoint_eval] skipping existing eval summary: {summary_path}", flush=True)
@@ -766,14 +788,15 @@ def main() -> None:
     print(f"[checkpoint_eval] GRPO checkpoint steps: {steps}", flush=True)
 
     for step in steps:
-        stage_name = f"grpo_public_ckpt_{step}" if args.public_only else f"grpo_ckpt_{step}"
+        base_stage_name = f"grpo_public_ckpt_{step}" if args.public_only else f"grpo_ckpt_{step}"
+        stage_name = f"{args.run_label}_{base_stage_name}" if args.run_label else base_stage_name
         summary_path = ns.EVAL_DIR / f"{stage_name}_eval_summary.json"
         if args.skip_existing and summary_path.exists():
             print(f"[checkpoint_eval] skipping existing eval summary: {summary_path}", flush=True)
             continue
 
         checkpoint_dir = args.checkpoint_root / f"checkpoint-{step}"
-        ensure_local_checkpoint(checkpoint_dir, args.drive_source, args)
+        downloaded_checkpoint = ensure_local_checkpoint(checkpoint_dir, args.drive_source, args)
         if not (checkpoint_dir / "adapter_model.safetensors").exists():
             raise FileNotFoundError(f"Checkpoint is missing adapter_model.safetensors: {checkpoint_dir}")
 
@@ -795,6 +818,9 @@ def main() -> None:
                 print(f"[checkpoint_eval] removing merged temp model: {merged_dir}", flush=True)
                 shutil.rmtree(merged_dir)
                 gc.collect()
+            if args.delete_local_checkpoint_after_eval and downloaded_checkpoint and checkpoint_dir.exists():
+                print(f"[checkpoint_eval] removing downloaded local checkpoint: {checkpoint_dir}", flush=True)
+                shutil.rmtree(checkpoint_dir)
             if args.checkpoint_sleep_seconds > 0:
                 print(
                     f"[checkpoint_eval] sleeping {args.checkpoint_sleep_seconds:g}s before next checkpoint",
