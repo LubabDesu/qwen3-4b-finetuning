@@ -25,6 +25,50 @@ Question:
 Options:
 {options_if_any}
 """
+SOLVE_PROMPTS = [
+    ('concise_solve', SOLVE_PROMPT),
+    (
+        'verify_carefully',
+        """You are an expert mathematician. Solve the problem carefully, checking each step before the final answer.
+
+Rules:
+- Keep the solution concise.
+- Verify arithmetic, units, signs, and requested formatting.
+- End with exactly one \boxed{{}}.
+- If options are provided, box only option letter(s).
+- If multiple [ANS] blanks exist, box exactly that many comma-separated answers in blank order.
+- Never output multiple \boxed{{}}.
+- Do not round unless asked.
+
+Question:
+{question}
+
+Options:
+{options_if_any}
+""",
+    ),
+    (
+        'alternative_method',
+        """You are an expert mathematician. Solve using a reliable method, then check the final requested operation.
+
+Rules:
+- Prefer a direct or alternative method that avoids rambling.
+- Check whether the problem asks for a remainder, rounded value, option letter, interval, or multiple blanks.
+- End with exactly one \boxed{{}}.
+- If options are provided, box only option letter(s).
+- If multiple [ANS] blanks exist, box exactly that many comma-separated answers in blank order.
+- Never output multiple \boxed{{}}.
+- Do not round unless asked.
+
+Question:
+{question}
+
+Options:
+{options_if_any}
+""",
+    ),
+]
+
 EXTRACT_PROMPT = """Extract the final answer from the reasoning.
 
 Rules:
@@ -43,7 +87,7 @@ Reasoning:
 """
 TEMPERATURES = [0.4, 0.5, 0.6, 0.7]
 SAMPLES_PER_TEMP = 2
-SEEDS = [104729, 104759]
+SEEDS = [104729, 104759, 104761, 104773, 104779, 104789, 104801, 104803]
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,6 +199,23 @@ def completed_keys(path: Path) -> set[tuple[int,float,int,int]]:
     return done
 
 
+def sample_plan() -> list[dict[str, Any]]:
+    plan=[]
+    sample_index=0
+    for temp in TEMPERATURES:
+        for rep in range(SAMPLES_PER_TEMP):
+            prompt_name, prompt_template = SOLVE_PROMPTS[sample_index % len(SOLVE_PROMPTS)]
+            plan.append({
+                'temperature': temp,
+                'seed': SEEDS[sample_index % len(SEEDS)],
+                'sample_index': sample_index,
+                'prompt_name': prompt_name,
+                'prompt_template': prompt_template,
+            })
+            sample_index += 1
+    return plan
+
+
 def main():
     if hasattr(sys.stdout,'reconfigure'): sys.stdout.reconfigure(line_buffering=True)
     args=parse_args(); started=time.time()
@@ -167,36 +228,37 @@ def main():
     print(f'[regen] hard_rows={len(hard_ids)} completed_candidates={len(done)} output={args.output}', flush=True)
     llm,tok=init_vllm(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    plan=sample_plan()
     with args.output.open('a',encoding='utf-8') as out_f:
-        for temp in TEMPERATURES:
-            seed=SEEDS[TEMPERATURES.index(temp) % len(SEEDS)]
+        for spec in plan:
+            temp=float(spec['temperature']); seed=int(spec['seed']); sample_idx=int(spec['sample_index'])
             jobs=[]
             for qid in hard_ids:
+                key=(qid,temp,seed,sample_idx)
+                if key in done: continue
                 row=private[qid]
-                prompt=SOLVE_PROMPT.format(question=row.get('question','').rstrip(), options_if_any=options_text(row))
+                prompt=spec['prompt_template'].format(question=row.get('question','').rstrip(), options_if_any=options_text(row))
                 rendered=render_prompt(tok, prompt)
-                jobs.append((qid,row,prompt,rendered))
-            for i in tqdm(range(0,len(jobs),args.batch_size), desc=f'solve temp={temp}'):
+                jobs.append((qid,row,prompt,rendered,spec['prompt_name'],sample_idx,seed,temp))
+            for i in tqdm(range(0,len(jobs),args.batch_size), desc=f"solve temp={temp} sample={sample_idx} prompt={spec['prompt_name']}"):
                 batch=jobs[i:i+args.batch_size]
                 prompts=[x[3] for x in batch]
-                outs=llm.generate(prompts, sampling(SAMPLES_PER_TEMP,temp,args.max_tokens,seed))
+                outs=llm.generate(prompts, sampling(1,temp,args.max_tokens,seed))
                 extract_jobs=[]
-                for (qid,row,prompt,_),out in zip(batch,outs):
-                    for sample_idx,cand in enumerate(out.outputs):
-                        key=(qid,float(temp),seed,sample_idx)
-                        if key in done: continue
-                        reasoning=cand.text.strip()
-                        ep=EXTRACT_PROMPT.format(question=row.get('question','').rstrip(), options_if_any=options_text(row), reasoning=reasoning)
-                        extract_jobs.append({'qid':qid,'row':row,'solve_prompt':prompt,'reasoning':reasoning,'temperature':temp,'seed':seed,'sample_index':sample_idx,'extract_prompt':ep})
+                for (qid,row,prompt,_,prompt_name,sample_idx,seed,temp),out in zip(batch,outs):
+                    reasoning=out.outputs[0].text.strip() if out.outputs else ''
+                    ep=EXTRACT_PROMPT.format(question=row.get('question','').rstrip(), options_if_any=options_text(row), reasoning=reasoning)
+                    extract_jobs.append({'qid':qid,'row':row,'solve_prompt':prompt,'prompt_name':prompt_name,'reasoning':reasoning,'temperature':temp,'seed':seed,'sample_index':sample_idx,'extract_prompt':ep})
                 for j in range(0,len(extract_jobs),args.batch_size):
                     eb=extract_jobs[j:j+args.batch_size]
-                    eprompts=[render_prompt(tok, x['extract_prompt'], system='You extract final answers exactly.') for x in eb]
+                    eprompts=[render_prompt(tok, x['extract_prompt'], system='You extract final answers exactly.') + '\\boxed{' for x in eb]
                     eouts=llm.generate(eprompts, sampling(1,0.0,args.extract_max_tokens,99991))
                     for item,eout in zip(eb,eouts):
-                        extraction=eout.outputs[0].text.strip() if eout.outputs else ''
+                        extracted_suffix=eout.outputs[0].text.strip() if eout.outputs else ''
+                        extraction='\\boxed{' + extracted_suffix
                         rec={
                             'question_id':item['qid'], 'temperature':item['temperature'], 'seed':item['seed'], 'sample_index':item['sample_index'],
-                            'reasoning':item['reasoning'], 'extraction':extraction, 'prompt':item['solve_prompt'],
+                            'prompt_name':item['prompt_name'], 'reasoning':item['reasoning'], 'extraction':extraction, 'prompt':item['solve_prompt'],
                         }
                         out_f.write(json.dumps(rec,ensure_ascii=False)+'\n')
                     out_f.flush()
