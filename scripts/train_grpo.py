@@ -37,7 +37,41 @@ from transformers import (
     TrainerState,
     TrainingArguments,
 )
+
+try:
+    import vllm.sampling_params as _vllm_sampling_params
+
+    if not hasattr(_vllm_sampling_params, "GuidedDecodingParams") and hasattr(
+        _vllm_sampling_params, "StructuredOutputsParams"
+    ):
+        _vllm_sampling_params.GuidedDecodingParams = _vllm_sampling_params.StructuredOutputsParams
+
+    _sampling_params_init = _vllm_sampling_params.SamplingParams.__init__
+
+    def _sampling_params_init_compat(self, *args, **kwargs):
+        guided_decoding = kwargs.pop("guided_decoding", None)
+        if guided_decoding is not None and "structured_outputs" not in kwargs:
+            kwargs["structured_outputs"] = guided_decoding
+        return _sampling_params_init(self, *args, **kwargs)
+
+    if not getattr(_vllm_sampling_params.SamplingParams.__init__, "_grpo_compat", False):
+        _sampling_params_init_compat._grpo_compat = True
+        _vllm_sampling_params.SamplingParams.__init__ = _sampling_params_init_compat
+except Exception:
+    pass
+
 from trl import GRPOConfig, GRPOTrainer
+import trl.trainer.grpo_trainer as _trl_grpo_trainer
+
+_vllm_sampling_params_cls = _vllm_sampling_params.SamplingParams
+
+def _sampling_params_compat(*args, **kwargs):
+    guided_decoding = kwargs.pop("guided_decoding", None)
+    if guided_decoding is not None and "structured_outputs" not in kwargs:
+        kwargs["structured_outputs"] = guided_decoding
+    return _vllm_sampling_params_cls(*args, **kwargs)
+
+_trl_grpo_trainer.SamplingParams = _sampling_params_compat
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -804,6 +838,11 @@ class RcloneBackupCallback(TrainerCallback):
             str(checkpoint_path),
             f"{self.gdrive_remote}/grpo/checkpoint-{step}",
             "--progress",
+            "--transfers", "1",
+            "--checkers", "1",
+            "--tpslimit", "2",
+            "--drive-pacer-min-sleep", "200ms",
+            "--drive-pacer-burst", "1",
         ]
         print(f"\n[rclone] Backing up checkpoint-{step} to {self.gdrive_remote}...")
         try:

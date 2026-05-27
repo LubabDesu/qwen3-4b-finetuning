@@ -1,0 +1,22 @@
+{
+  "source_remaining_path": "artifacts/grpo/public_val_rest.jsonl",
+  "old_train_excluded_path": "artifacts/grpo/public_train_300.jsonl",
+  "seed": 20260525,
+  "remaining_rows": 826,
+  "train_rows": 526,
+  "val_rows": 300,
+  "old_train_rows": 300,
+  "old_train_overlap": 0,
+  "train_counts": {
+    "single": 157,
+    "multi": 194,
+    "mcq": 175
+  },
+  "val_counts": {
+    "mcq": 100,
+    "multi": 110,
+    "single": 90
+  },
+  "train_path": "artifacts/rs_sft_public/public_new_train526_for_rs_sft_generation.jsonl",
+  "val_path": "artifacts/rs_sft_public/public_new_val300_holdout.jsonl"
+}
