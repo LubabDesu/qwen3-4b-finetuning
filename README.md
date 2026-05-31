@@ -5,7 +5,9 @@ benchmark, covering free-form, MCQ, and multi-answer problems. The final result
 came from 9 post-training experiments plus an inference-time recovery pipeline.
 
 This repo contains the full reproducible inference pipeline (`run_inference.py`)
-and the key artifacts/scripts used to reach the final submission.
+and the key scripts used to build, train, evaluate, and package the final
+submission. Generated checkpoints, logs, draft submissions, and intermediate
+datasets are intentionally kept out of git.
 
 ---
 
@@ -187,15 +189,27 @@ It also provides a CLI. One call reproduces the submission CSV end-to-end.
 ## Repo Layout
 
 ```text
-run_inference.py              # single entry point, full pipeline
-scripts/judger.py             # competition judger
-scripts/build_draft12_safe.py # shared extraction / canonicalization helpers
-requirements.txt              # pinned inference deps
-requirements.full-freeze.txt  # exact frozen environment
+run_inference.py                         # single entry point, full inference pipeline
+competition-data/                        # public data and sample submission
+artifacts/post_training_curriculum/      # small checked-in notes/specs
+scripts/build_stage1_2_r2.py             # cleaned Stage 1.2 dataset builder
+scripts/sanity_check_stage1_2.py         # dataset validation
+scripts/train_stage1_2.py                # LoRA training entry point
+scripts/evaluate_stage1_2_checkpoints.py # checkpoint merge/eval harness
+scripts/judger.py                        # competition-style judging utilities
+scripts/build_draft12_safe.py            # extraction/canonicalization helpers
+requirements.txt                         # pinned inference deps
+requirements.full-freeze.txt             # exact frozen environment
 ```
 
-Not committed: checkpoints, logs, submissions, private data, model weight files,
-and local virtual environments.
+The rest of `scripts/` contains experiment utilities from the post-training
+search: GRPO, RS-SFT data construction, failure analysis, draft merging, and
+submission post-processing. They are kept for transparency, but the shortest
+path to reproduce the final CSV starts at `run_inference.py`.
+
+Not committed: checkpoints, logs, draft submissions, private data, model weight
+files, local virtual environments, scratch outputs, and generated intermediate
+datasets.
 
 ---
 
