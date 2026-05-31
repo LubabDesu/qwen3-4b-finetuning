@@ -9,6 +9,8 @@ and the key scripts used to build, train, evaluate, and package the final
 submission. Generated checkpoints, logs, draft submissions, and intermediate
 datasets are intentionally kept out of git.
 
+For the experiment-by-experiment retrospective, see `research_log.md`.
+
 ---
 
 ## TL;DR
